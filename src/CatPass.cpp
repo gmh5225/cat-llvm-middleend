@@ -31,9 +31,7 @@ namespace {
             Function *callee = callInst->getCalledFunction();
             if (callee->getName() == "CAT_new") {
               errs() << F.getName() << inst << inst << "\n";
-            } else if (callee->getName() == "CAT_add" ||
-                       callee->getName() == "CAT_sub" ||
-                       callee->getName() == "CAT_set") {
+            } else if (callee->getName() == "CAT_add" || callee->getName() == "CAT_sub" || callee->getName() == "CAT_set") {
               errs() << F.getName() << *(callInst->getArgOperand(0)) << inst << "\n";
             }
           }
