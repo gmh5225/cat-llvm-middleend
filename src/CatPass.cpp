@@ -1,5 +1,7 @@
 #include "llvm/Pass.h"
 #include "llvm/IR/Function.h"
+#include "llvm/IR/Instructions.h"
+#include "llvm/IR/Module.h"
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/IR/LegacyPassManager.h"
 #include "llvm/Transforms/IPO/PassManagerBuilder.h"
@@ -15,21 +17,35 @@ namespace {
     // This function is invoked once at the initialization phase of the compiler
     // The LLVM IR of functions isn't ready at this point
     bool doInitialization (Module &M) override {
-      errs() << "Hello LLVM World at \"doInitialization\"\n" ;
+      // errs() << "Hello LLVM World at \"doInitialization\"\n" ;
       return false;
     }
 
     // This function is invoked once per function compiled
     // The LLVM IR of the input functions is ready and it can be analyzed and/or transformed
     bool runOnFunction (Function &F) override {
-      errs() << "Hello LLVM World at \"runOnFunction\"\n" ;
+      for (auto& bb : F) {
+        for (auto& inst : bb) {
+          if (isa<CallInst>(&inst)) {
+            CallInst *callInst = cast<CallInst>(&inst);
+            Function *callee = callInst->getCalledFunction();
+            if (callee->getName() == "CAT_new") {
+              errs() << F.getName() << inst << inst << "\n";
+            } else if (callee->getName() == "CAT_add" ||
+                       callee->getName() == "CAT_sub" ||
+                       callee->getName() == "CAT_set") {
+              errs() << F.getName() << *(callInst->getArgOperand(0)) << inst << "\n";
+            }
+          }
+        }
+      }
       return false;
     }
 
     // We don't modify the program, so we preserve all analyses.
     // The LLVM IR of functions isn't ready at this point
     void getAnalysisUsage(AnalysisUsage &AU) const override {
-      errs() << "Hello LLVM World at \"getAnalysisUsage\"\n" ;
+      // errs() << "Hello LLVM World at \"getAnalysisUsage\"\n" ;
       AU.setPreservesAll();
     }
   };
