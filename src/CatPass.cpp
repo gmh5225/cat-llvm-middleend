@@ -1,22 +1,19 @@
 #include "llvm/Pass.h"
 #include "llvm/ADT/BitVector.h"
 #include "llvm/IR/BasicBlock.h"
+#include "llvm/IR/Constants.h"
 #include "llvm/IR/Function.h"
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/InstIterator.h"
+#include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/LegacyPassManager.h"
 #include "llvm/IR/Module.h"
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/Transforms/IPO/PassManagerBuilder.h"
-#include <set>
 #include <map>
+#include <set>
 #include <vector>
-
-#define CAT_new_id CAT_new
-#define CAT_add_id CAT_add
-#define CAT_sub_id CAT_sub
-#define CAT_get_id CAT_get
-#define CAT_set_id CAT_set
+#include "llvm/Transforms/Utils/BasicBlockUtils.h"
 
 using namespace llvm;
 
@@ -80,6 +77,7 @@ namespace {
             kill[numToInst[bit]].set(instToNum[inst]);
           }
         }
+        toKill.clear();
 
         bool done;
         do {
@@ -106,6 +104,8 @@ namespace {
             }
           }
         } while (!done);
+        gen.clear();
+        kill.clear();
 
         for (auto &I : instructions(F)) {
             std::set<Instruction *> inSet;
@@ -121,12 +121,8 @@ namespace {
             inSets[&F][&I] = inSet;
             outSets[&F][&I] = outSet;
         }
-
         numToInst.clear();
         instToNum.clear();
-        gen.clear();
-        kill.clear();
-        toKill.clear();
         in.clear();
         out.clear();
       }
@@ -136,19 +132,76 @@ namespace {
     // This function is invoked once per function compiled
     // The LLVM IR of the input functions is ready and it can be analyzed and/or transformed
     bool runOnFunction (Function &F) override {
-      errs() << "Function \"" << F.getName() << "\"\n";
-      for (auto &I : instructions(F)) {
-        errs() << "INSTRUCTION:" << I << "\nIN\n{\n";
-        for (auto inst : inSets[&F][&I]) {
-          errs() << *inst << "\n";
+      bool modified = false;
+
+      // Constant propagation
+      for (auto &B : F) {
+        std::map<Instruction *, Value *> toReplace;
+
+        for (auto &I : B) {
+          if (CallInst *call = dyn_cast<CallInst>(&I)) {
+            Function *callee = call->getCalledFunction();
+            Module *M = F.getParent();
+            
+            if (M->getFunction("CAT_get") == callee) {
+              std::set<Instruction *> inSet = inSets[&F][&I];
+              int64_t constant;
+              Value *v;
+              bool constantInitalized = false;
+              bool runPropagation = false;
+              Instruction *callArg = cast<Instruction>(call->getArgOperand(0));
+
+              for (auto inst : inSet) {
+                Function *instCallee = cast<CallInst>(inst)->getCalledFunction();
+
+                if (M->getFunction("CAT_new") == instCallee && inst == callArg) {
+                  v = inst->getOperand(0);
+                  
+                  if (ConstantInt *c = dyn_cast<ConstantInt>(v)) {
+                    if (!constantInitalized) {
+                      constant = c->getSExtValue();
+                      constantInitalized = true;
+                      runPropagation = true;
+                    }
+                    runPropagation = runPropagation && constant == c->getSExtValue();
+                  }
+                } else if (M->getFunction("CAT_set") == instCallee && inst->getOperand(0) == callArg) {
+                  v = inst->getOperand(1);
+                  
+                  if (ConstantInt *c = dyn_cast<ConstantInt>(v)) {
+                    if (!constantInitalized) {
+                      constant = c->getSExtValue();
+                      constantInitalized = true;
+                      runPropagation = true;
+                    }
+                    runPropagation = runPropagation && constant == c->getSExtValue();
+                  }                  
+                }
+              }
+
+              if (runPropagation) {
+                toReplace[&I] = v;
+                modified = true;
+              }
+            }
+          }
         }
-        errs() << "}\nOUT\n{\n";
-        for (auto inst : outSets[&F][&I]) {
-          errs() << *inst << "\n";
+
+        for (auto &[I, constValue] : toReplace) {
+          BasicBlock::iterator ii(I);
+          ReplaceInstWithValue(B.getInstList(), ii, constValue);
         }
-        errs() << "}\n";
       }
-      return false;
+
+      // Constant folding
+      for (auto &B : F) {
+        for (auto &I : B) {
+          if (CallInst *call = dyn_cast<CallInst>(&I)) {
+            IRBuilder<> builder(call);
+          }
+        }
+      }
+      return modified;
     }
 
     // We don't modify the program, so we preserve all analyses.
