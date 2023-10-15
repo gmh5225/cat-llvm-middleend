@@ -15,24 +15,41 @@
 #include <set>
 #include <vector>
 
+enum CAT_API {
+  CAT_new,
+  CAT_add,
+  CAT_sub,
+  CAT_get,
+  CAT_set,
+  CAT_destroy
+};
+
 using namespace llvm;
 
 namespace {
   struct CAT : public FunctionPass {
     static char ID; 
+    Module* currentModule;
+    std::map<Function *, CAT_API> CATMap;
 
     CAT() : FunctionPass(ID) {}
-
-    std::map<Function *, std::map<Instruction *, std::set<Instruction *>>> inSets;
-    std::map<Function *, std::map<Instruction *, std::set<Instruction *>>> outSets;
 
     // This function is invoked once at the initialization phase of the compiler
     // The LLVM IR of functions isn't ready at this point
     bool doInitialization (Module &M) override {
+      currentModule = &M;
+      CATMap[M.getFunction("CAT_new")] = CAT_new;
+      CATMap[M.getFunction("CAT_add")] = CAT_add;
+      CATMap[M.getFunction("CAT_sub")] = CAT_sub;
+      CATMap[M.getFunction("CAT_get")] = CAT_get;
+      CATMap[M.getFunction("CAT_set")] = CAT_set;
+      CATMap[M.getFunction("CAT_destroy")] = CAT_destroy;
       return false;
     }
 
-    void createReachingDefs(Function &F) {
+    void createReachingDefinitions(Function &F, 
+                                   std::map<Instruction *, std::set<Instruction *>> &inSets, 
+                                   std::map<Instruction *, std::set<Instruction *>> &outSets) {
       std::vector<Instruction *> numToInst;
       std::map<Instruction *, unsigned> instToNum;
       std::map<Instruction *, BitVector> gen;
@@ -41,7 +58,6 @@ namespace {
       std::map<Instruction *, BitVector> in;
       std::map<Instruction *, BitVector> out;
 
-      Module *M = F.getParent();
       unsigned num = 0;
       unsigned size = 0;
       for (auto &B : F) {
@@ -58,13 +74,18 @@ namespace {
         
         if (CallInst *call = dyn_cast<CallInst>(&I)) {
           Function *callee = call->getCalledFunction();
-          if (M->getFunction("CAT_new") == callee) {
-            genSet.set(num);
-          } else if (M->getFunction("CAT_add") == callee || 
-                     M->getFunction("CAT_sub") == callee || 
-                     M->getFunction("CAT_set") == callee) {
-            genSet.set(num);
-            toKill.push_back(&I);
+          switch (CATMap[callee]) {
+            case CAT_new:
+              genSet.set(num);
+              break;
+            case CAT_add:
+            case CAT_sub:
+            case CAT_set:
+              genSet.set(num);
+              toKill.push_back(&I);
+              break;
+            default:
+              break;
           }
         }
 
@@ -121,47 +142,56 @@ namespace {
             outSet.insert(numToInst[bit]);
           }
 
-          inSets[&F][&I] = inSet;
-          outSets[&F][&I] = outSet;
+          inSets[&I] = inSet;
+          outSets[&I] = outSet;
       }
       return;
     }
 
-    Value *isConstant(Function &F, Instruction &I, Value *v) {
+    Value *isConstant(std::set<Instruction *> inSet, Value *v) {
       Instruction *valInst = cast<Instruction>(v);
-      std::set<Instruction *> inSet = inSets[&F][&I];
       Value *valPtr = nullptr;
       bool initialized = false;
       int64_t c;
 
       for (auto inst : inSet) {
         if (CallInst *call = dyn_cast<CallInst>(inst)) {
-          Module *M = F.getParent();
           Function *callee = call->getCalledFunction();
-
-          if ((M->getFunction("CAT_new") == callee) && (valInst == inst)) {
-            if (ConstantInt *constant = dyn_cast<ConstantInt>(call->getArgOperand(0))) {
-              if (!initialized) {
-                c = constant->getSExtValue();
-                valPtr = call->getArgOperand(0);
-                initialized = true;
-              } else if (c != constant->getSExtValue()) {
+          switch (CATMap[callee]) {
+            case CAT_new:
+              if (valInst == inst) {
+                if (ConstantInt *constant = dyn_cast<ConstantInt>(call->getArgOperand(0))) {
+                  if (!initialized) {
+                    c = constant->getSExtValue();
+                    valPtr = call->getArgOperand(0);
+                    initialized = true;
+                  } else if (c != constant->getSExtValue()) {
+                    return nullptr;
+                  }
+                }
+              }
+              break;
+            case CAT_add:
+            case CAT_sub:
+              if (valInst == call->getArgOperand(0)) {
                 return nullptr;
               }
-            }
-          } else if ((M->getFunction("CAT_set") == callee) && (valInst == call->getArgOperand(0))) {
-            if (ConstantInt *constant = dyn_cast<ConstantInt>(call->getArgOperand(1))) {
-              if (!initialized) {
-                c = constant->getSExtValue();
-                valPtr = call->getArgOperand(1);
-                initialized = true;
-              } else if (c != constant->getSExtValue()) {
-                return nullptr;
+              break;
+            case CAT_set:
+              if (valInst == call->getArgOperand(0)) {
+                if (ConstantInt *constant = dyn_cast<ConstantInt>(call->getArgOperand(1))) {
+                  if (!initialized) {
+                    c = constant->getSExtValue();
+                    valPtr = call->getArgOperand(1);
+                    initialized = true;
+                  } else if (c != constant->getSExtValue()) {
+                    return nullptr;
+                  }
+                }                
               }
-            }
-          } else if (((M->getFunction("CAT_add") == callee) || (M->getFunction("CAT_sub") == callee)) &&
-                     (valInst == call->getArgOperand(0))) {
-            return nullptr;
+              break;
+            default:
+              break;
           }
         }
       }
@@ -173,7 +203,9 @@ namespace {
     // The LLVM IR of the input functions is ready and it can be analyzed and/or transformed
     bool runOnFunction (Function &F) override {
       bool modified = false;
-      createReachingDefs(F);
+      std::map<Instruction *, std::set<Instruction *>> inSets;
+      std::map<Instruction *, std::set<Instruction *>> outSets;
+      createReachingDefinitions(F, inSets, outSets);
 
       // Constant propagation
       for (auto &B : F) {
@@ -182,13 +214,17 @@ namespace {
         for (auto &I : B) {
           if (CallInst *call = dyn_cast<CallInst>(&I)) {
             Function *callee = call->getCalledFunction();
-            Module *M = F.getParent();
-
-            if (M->getFunction("CAT_get") == callee) {
-              if (Value* c = isConstant(F, I, call->getArgOperand(0))) {
+            if (currentModule->getFunction("CAT_get") == callee) {
+              if (Value* c = isConstant(inSets[&I], call->getArgOperand(0))) {
                 toReplace[&I] = c;
                 modified = true;
               }
+            }
+          }
+          if (PHINode *phi = dyn_cast<PHINode>(&I)) {
+            for (unsigned j = 0; j < phi->getNumIncomingValues(); j++) {
+              Value *phiVal = phi->getIncomingValue(j);
+              errs() << *phiVal << "\n";
             }
           }
         }
@@ -198,67 +234,95 @@ namespace {
           ReplaceInstWithValue(B.getInstList(), ii, constValue);
         }
       }
-
+      
       // Constant folding
       std::vector<Instruction *> toDelete;
-      std::vector<Instruction *> toSimplify;
+      std::map<Instruction *, Value *> toSimplify;
 
-      for (auto &B : F) {
-        for (auto &I : B) {
-          if (CallInst *call = dyn_cast<CallInst>(&I)) {
-            IRBuilder<> builder(call);
-            
-            Function *callee = call->getCalledFunction();
-            Module *M = F.getParent();
+      for (auto &I : instructions(F)) {
+        if (CallInst *call = dyn_cast<CallInst>(&I)) {
+          IRBuilder<> builder(call);
+          
+          Function *callee = call->getCalledFunction();
+          if (currentModule->getFunction("CAT_add") == callee) {
+            Value* arg1 = isConstant(inSets[&I], call->getArgOperand(1));
+            Value* arg2 = isConstant(inSets[&I], call->getArgOperand(2));
 
-            if (M->getFunction("CAT_add") == callee) {
-              Value* arg1 = isConstant(F, I, call->getArgOperand(1));
-              Value* arg2 = isConstant(F, I, call->getArgOperand(2));
+            if (arg1 && arg2) {
+              ConstantInt *const1 = cast<ConstantInt>(arg1);
+              ConstantInt *const2 = cast<ConstantInt>(arg2);
 
-              if (arg1 && arg2) {
-                ConstantInt *const1 = cast<ConstantInt>(arg1);
-                ConstantInt *const2 = cast<ConstantInt>(arg2);
+              IntegerType *intType = IntegerType::get(currentModule->getContext(), 64);
+              Value *sum = ConstantInt::get(intType, const1->getSExtValue() + const2->getSExtValue(), true);
 
-                IntegerType *intType = IntegerType::get(M->getContext(), 64);
-                Value *sum = ConstantInt::get(intType, const1->getSExtValue() + const2->getSExtValue(), true);
+              builder.CreateCall(currentModule->getFunction("CAT_set"), {call->getArgOperand(0), sum});
 
-                builder.CreateCall(M->getFunction("CAT_set"), {call->getArgOperand(0), sum});
-                toDelete.push_back(&I);
-                modified = true;
+              toDelete.push_back(&I);
+              modified = true;
+            } else if (arg1) {
+              ConstantInt *const1 = cast<ConstantInt>(arg1);
+              if (const1->getSExtValue() == 0) {
+                toSimplify[&I] = call->getArgOperand(2);
               }
-            } else if (M->getFunction("CAT_sub") == callee) {
-              Value* arg1 = isConstant(F, I, call->getArgOperand(1));
-              Value* arg2 = isConstant(F, I, call->getArgOperand(2));
+            } else if (arg2) {
+              ConstantInt *const2 = cast<ConstantInt>(arg2);
+              if (const2->getSExtValue() == 0) {
+                toSimplify[&I] = call->getArgOperand(1);
+              }
+            }
+          } else if (currentModule->getFunction("CAT_sub") == callee) {
+            Value* arg1 = isConstant(inSets[&I], call->getArgOperand(1));
+            Value* arg2 = isConstant(inSets[&I], call->getArgOperand(2));
 
-              if (arg1 && arg2) {
-                ConstantInt *const1 = cast<ConstantInt>(arg1);
-                ConstantInt *const2 = cast<ConstantInt>(arg2);
+            if (arg1 && arg2) {
+              ConstantInt *const1 = cast<ConstantInt>(arg1);
+              ConstantInt *const2 = cast<ConstantInt>(arg2);
 
-                IntegerType *intType = IntegerType::get(M->getContext(), 64);
-                Value *diff = ConstantInt::get(intType, const1->getSExtValue() - const2->getSExtValue(), true);
+              IntegerType *intType = IntegerType::get(currentModule->getContext(), 64);
+              Value *diff = ConstantInt::get(intType, const1->getSExtValue() - const2->getSExtValue(), true);
 
-                builder.CreateCall(M->getFunction("CAT_set"), {call->getArgOperand(0), diff});
-                toDelete.push_back(&I);
-                modified = true;
+              builder.CreateCall(currentModule->getFunction("CAT_set"), {call->getArgOperand(0), diff});
+
+              toDelete.push_back(&I);
+              modified = true;
+            } else if (arg2) {
+              ConstantInt *const2 = cast<ConstantInt>(arg2);
+              if (const2->getSExtValue() == 0) {
+                toSimplify[&I] = call->getArgOperand(1);
               }
             }
           }
         }
       }
 
-      for (auto inst : toDelete) {
-        inst->eraseFromParent();
+      for (auto I : toDelete) {
+        I->eraseFromParent();
+      }
+      toDelete.clear();
+      
+      // Algebraic simplification
+      for (auto [I, variable] : toSimplify) {
+        if (CallInst *call = dyn_cast<CallInst>(I)) {
+          IRBuilder<> builder(call);
+
+          Value *catGet = builder.CreateCall(currentModule->getFunction("CAT_get"), {variable});
+          builder.CreateCall(currentModule->getFunction("CAT_set"), {call->getArgOperand(0), catGet});
+
+          toDelete.push_back(I);
+          modified = true;
+        }
       }
 
-      // Algebraic simplification
+      for (auto I : toDelete) {
+        I->eraseFromParent();
+      }
+
       return modified;
     }
 
     // We don't modify the program, so we preserve all analyses.
     // The LLVM IR of functions isn't ready at this point
-    void getAnalysisUsage(AnalysisUsage &AU) const override {
-      AU.setPreservesAll();
-    }
+    void getAnalysisUsage(AnalysisUsage &AU) const override { }
   };
 }
 
