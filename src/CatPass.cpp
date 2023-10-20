@@ -11,6 +11,7 @@
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/Transforms/IPO/PassManagerBuilder.h"
 #include "llvm/Transforms/Utils/BasicBlockUtils.h"
+#include <deque>
 #include <map>
 #include <set>
 #include <vector>
@@ -139,31 +140,39 @@ namespace {
         }
       }
 
-      bool done;
-      do {
-        done = true;
+      BitVector workList = BitVector(size);
+      workList.set();
 
-        for (auto &B : F) {
-          for (auto &I : B) {
-            Instruction *prev = I.getPrevNode();
-            if (!prev) {
-              for (auto pred : predecessors(&B)) {
-                in[&I] |= out[pred->getTerminator()];
-              }
-            } else {
-              in[&I] |= out[prev];
+      while (!workList.none()) {
+        int first = workList.find_first();
+        workList.reset(first);
+        Instruction *inst = numToInst[first];
+        BitVector oldOut = out[inst];
+        Instruction *prev = inst->getPrevNode();
+        
+        if (!prev) {
+          for (auto pred : predecessors(inst->getParent())) {
+            in[inst] |= out[pred->getTerminator()];
+          }
+        } else {
+          in[inst] |= out[prev];
+        }
+
+        out[inst] |= in[inst];
+        out[inst].reset(kill[inst]);
+        out[inst] |= gen[inst];
+
+        if (oldOut != out[inst]) {
+          Instruction *next = inst->getNextNode();
+          if (!next) {
+            for (auto succ : successors(inst->getParent())) {
+              workList.set(instToNum[&(succ->front())]);
             }
-
-            BitVector tempOut = BitVector(size);
-            tempOut |= in[&I];
-            tempOut.reset(kill[&I]);
-            tempOut |= gen[&I];
-
-            done = done && (out[&I] == tempOut);
-            out[&I] = tempOut;
+          } else {
+            workList.set(instToNum[next]);
           }
         }
-      } while (!done);
+      }
 
       for (auto &I : instructions(F)) {
           std::set<Instruction *> inSet;
@@ -182,7 +191,7 @@ namespace {
       return;
     }
 
-    bool phiContainsLoop(Value *v, std::set<Value *> &seen) {
+    bool phiContainsCycle(Value *v, std::set<Value *> &seen) {
       if (seen.contains(v)) {
         return true;
       }
@@ -194,7 +203,7 @@ namespace {
       seen.insert(v);
       PHINode *phi = cast<PHINode>(v);
       for (unsigned i = 0; i < phi->getNumIncomingValues(); i++) {
-        loop |= phiContainsLoop(phi->getIncomingValue(i), seen);
+        loop |= phiContainsCycle(phi->getIncomingValue(i), seen);
       }
       seen.erase(v);
       return loop;
@@ -225,7 +234,7 @@ namespace {
           if (isa<UndefValue>(phiVal)) {
             continue;
           }
-          if (phiContainsLoop(v, seen)) {
+          if (phiContainsCycle(v, seen)) {
             return nullptr;
           }
           if (Value *constantVal = isConstant(inSet, phiVal)) {
