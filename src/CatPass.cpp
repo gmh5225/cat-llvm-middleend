@@ -47,9 +47,37 @@ namespace {
       return false;
     }
 
-    void createReachingDefinitions(Function &F, 
-                                   std::map<Instruction *, std::set<Instruction *>> &inSets, 
-                                   std::map<Instruction *, std::set<Instruction *>> &outSets) {
+    void getCatInstructions(Function &F, std::set<Instruction *> &CATInstructions) {
+      for (auto &I : instructions(F)) {
+        if (CallInst *call = dyn_cast<CallInst>(&I)) {
+          Function *callee = call->getCalledFunction();
+          if (CATMap.contains(callee)) {
+            CATInstructions.insert(&I);
+          }
+        }
+      }
+    }
+
+    void printReachingDefs(Function &F,
+                           std::map<Instruction *, std::set<Instruction *>> inSets, 
+                           std::map<Instruction *, std::set<Instruction *>> outSets) {
+      errs() << "FUNCTION \"" << F.getName() << "\"\n";
+      for (auto &I : instructions(F)) {
+        errs() << "INSTRUCTION:" << I << "\nIN\n{\n";
+        for (auto in : inSets[&I]) {
+          errs() << *in << "\n";
+        }
+        errs() << "}\nOUT\n{\n";
+        for (auto out : outSets[&I]) {
+          errs() << *out << "\n";
+        }
+        errs() << "}\n";
+      }
+    }
+
+    void createReachingDefs(Function &F, 
+                            std::map<Instruction *, std::set<Instruction *>> &inSets, 
+                            std::map<Instruction *, std::set<Instruction *>> &outSets) {
       std::vector<Instruction *> numToInst;
       std::map<Instruction *, unsigned> instToNum;
       std::map<Instruction *, BitVector> gen;
@@ -74,19 +102,22 @@ namespace {
         
         if (CallInst *call = dyn_cast<CallInst>(&I)) {
           Function *callee = call->getCalledFunction();
-          switch (CATMap[callee]) {
-            case CAT_new:
-              genSet.set(num);
-              break;
-            case CAT_add:
-            case CAT_sub:
-            case CAT_set:
-              genSet.set(num);
-              toKill.push_back(&I);
-              break;
-            default:
-              break;
+          if (CATMap.contains(callee)) {
+            switch (CATMap.at(callee)) {
+              case CAT_new:
+                genSet.set(num);
+                break;
+              case CAT_add:
+              case CAT_sub:
+              case CAT_set:
+                genSet.set(num);
+                toKill.push_back(&I);
+                break;
+              default:
+                break;
+            }
           }
+          
         }
 
         gen[&I] = genSet;
@@ -96,6 +127,9 @@ namespace {
 
       for (auto inst : toKill) {
         CallInst *call = cast<CallInst>(inst);
+        if (isa<Argument>(call->getArgOperand(0))) {
+          continue;
+        }
         Instruction *arg = cast<Instruction>(call->getArgOperand(0));
 
         kill[inst].set(instToNum[arg]);
@@ -148,50 +182,106 @@ namespace {
       return;
     }
 
+    bool phiContainsLoop(Value *v, std::set<Value *> &seen) {
+      if (seen.contains(v)) {
+        return true;
+      }
+      if (!isa<PHINode>(v)) {
+        return false;
+      }
+
+      bool loop = false;
+      seen.insert(v);
+      PHINode *phi = cast<PHINode>(v);
+      for (unsigned i = 0; i < phi->getNumIncomingValues(); i++) {
+        loop |= phiContainsLoop(phi->getIncomingValue(i), seen);
+      }
+      seen.erase(v);
+      return loop;
+    }
+
     Value *isConstant(std::set<Instruction *> inSet, Value *v) {
-      Instruction *valInst = cast<Instruction>(v);
+      if (isa<Argument>(v)) {
+        return nullptr;
+      }
+
+      for (auto user : v->users()) {
+        if (CallInst *call = dyn_cast<CallInst>(user)) {
+          Function *callee = call->getCalledFunction();
+          if (!CATMap.contains(callee)) {
+            return nullptr;
+          }
+        }
+      }
+
       Value *valPtr = nullptr;
-      bool initialized = false;
       int64_t c;
+      bool initialized = false;
+      std::set<Value *> seen;
+
+      if (PHINode *p = dyn_cast<PHINode>(v)) {
+        for (unsigned j = 0; j < p->getNumIncomingValues(); j++) {
+          Value *phiVal = p->getIncomingValue(j);
+          if (isa<UndefValue>(phiVal)) {
+            continue;
+          }
+          if (phiContainsLoop(v, seen)) {
+            return nullptr;
+          }
+          if (Value *constantVal = isConstant(inSet, phiVal)) {
+            if (ConstantInt *constant = dyn_cast<ConstantInt>(constantVal)) {
+              if (!initialized) {
+                valPtr = constantVal;
+                c = constant->getSExtValue();
+                initialized = true;
+              } else if (c != constant->getSExtValue()) {
+                return nullptr;
+              }
+            }
+          }
+        }
+      }
 
       for (auto inst : inSet) {
         if (CallInst *call = dyn_cast<CallInst>(inst)) {
           Function *callee = call->getCalledFunction();
-          switch (CATMap[callee]) {
-            case CAT_new:
-              if (valInst == inst) {
-                if (ConstantInt *constant = dyn_cast<ConstantInt>(call->getArgOperand(0))) {
-                  if (!initialized) {
-                    c = constant->getSExtValue();
-                    valPtr = call->getArgOperand(0);
-                    initialized = true;
-                  } else if (c != constant->getSExtValue()) {
-                    return nullptr;
+          if (CATMap.contains(callee)) {
+            switch (CATMap.at(callee)) {
+              case CAT_new:
+                if (v == inst) {
+                  if (ConstantInt *constant = dyn_cast<ConstantInt>(call->getArgOperand(0))) {
+                    if (!initialized) {
+                      valPtr = call->getArgOperand(0);
+                      c = constant->getSExtValue();
+                      initialized = true;
+                    } else if (c != constant->getSExtValue()) {
+                      return nullptr;
+                    }
                   }
                 }
-              }
-              break;
-            case CAT_add:
-            case CAT_sub:
-              if (valInst == call->getArgOperand(0)) {
-                return nullptr;
-              }
-              break;
-            case CAT_set:
-              if (valInst == call->getArgOperand(0)) {
-                if (ConstantInt *constant = dyn_cast<ConstantInt>(call->getArgOperand(1))) {
-                  if (!initialized) {
-                    c = constant->getSExtValue();
-                    valPtr = call->getArgOperand(1);
-                    initialized = true;
-                  } else if (c != constant->getSExtValue()) {
-                    return nullptr;
+                break;
+              case CAT_add:
+              case CAT_sub:
+                if (v == call->getArgOperand(0)) {
+                  return nullptr;
+                }
+                break;
+              case CAT_set:
+                if (v == call->getArgOperand(0)) {
+                  if (ConstantInt *constant = dyn_cast<ConstantInt>(call->getArgOperand(1))) {
+                    if (!initialized) {
+                      valPtr = call->getArgOperand(1);
+                      c = constant->getSExtValue();
+                      initialized = true;
+                    } else if (c != constant->getSExtValue()) {
+                      return nullptr;
+                    }
                   }
-                }                
-              }
-              break;
-            default:
-              break;
+                }
+                break;
+              default:
+                break;
+            }
           }
         }
       }
@@ -199,54 +289,46 @@ namespace {
       return valPtr;
     }
 
-    // This function is invoked once per function compiled
-    // The LLVM IR of the input functions is ready and it can be analyzed and/or transformed
-    bool runOnFunction (Function &F) override {
+    bool runConstantPropagation(std::map<Instruction *, std::set<Instruction *>> inSets,
+                                std::map<Instruction *,std::set<Instruction *>> outSets,
+                                std::set<Instruction *> CATInstructions) {
       bool modified = false;
-      std::map<Instruction *, std::set<Instruction *>> inSets;
-      std::map<Instruction *, std::set<Instruction *>> outSets;
-      createReachingDefinitions(F, inSets, outSets);
+      std::map<Instruction *, Value *> toReplace;
 
-      // Constant propagation
-      for (auto &B : F) {
-        std::map<Instruction *, Value *> toReplace;
-
-        for (auto &I : B) {
-          if (CallInst *call = dyn_cast<CallInst>(&I)) {
-            Function *callee = call->getCalledFunction();
-            if (currentModule->getFunction("CAT_get") == callee) {
-              if (Value* c = isConstant(inSets[&I], call->getArgOperand(0))) {
-                toReplace[&I] = c;
-                modified = true;
-              }
+      for (auto I : CATInstructions) {
+        if (CallInst *call = dyn_cast<CallInst>(I)) {
+          Function *callee = call->getCalledFunction();
+          if (currentModule->getFunction("CAT_get") == callee) {
+            if (Value *c = isConstant(inSets[I], call->getArgOperand(0))) {
+              toReplace[I] = c;
+              modified = true;
             }
           }
-          if (PHINode *phi = dyn_cast<PHINode>(&I)) {
-            for (unsigned j = 0; j < phi->getNumIncomingValues(); j++) {
-              Value *phiVal = phi->getIncomingValue(j);
-              errs() << *phiVal << "\n";
-            }
-          }
-        }
-
-        for (auto [I, constValue] : toReplace) {
-          BasicBlock::iterator ii(I);
-          ReplaceInstWithValue(B.getInstList(), ii, constValue);
         }
       }
-      
-      // Constant folding
-      std::vector<Instruction *> toDelete;
-      std::map<Instruction *, Value *> toSimplify;
 
-      for (auto &I : instructions(F)) {
-        if (CallInst *call = dyn_cast<CallInst>(&I)) {
+      for (auto [I, constValue] : toReplace) {
+        BasicBlock::iterator ii(I);
+        ReplaceInstWithValue(I->getParent()->getInstList(), ii, constValue);
+      }
+
+      return modified;
+    }
+
+    bool runConstantFolding(std::map<Instruction *, std::set<Instruction *>> inSets,
+                            std::map<Instruction *,std::set<Instruction *>> outSets,
+                            std::set<Instruction *> CATInstructions) {
+      bool modified = false;
+      std::vector<Instruction *> toDelete;
+
+      for (auto I : CATInstructions) {
+        if (CallInst *call = dyn_cast<CallInst>(I)) {
           IRBuilder<> builder(call);
           
           Function *callee = call->getCalledFunction();
           if (currentModule->getFunction("CAT_add") == callee) {
-            Value* arg1 = isConstant(inSets[&I], call->getArgOperand(1));
-            Value* arg2 = isConstant(inSets[&I], call->getArgOperand(2));
+            Value* arg1 = isConstant(inSets[I], call->getArgOperand(1));
+            Value* arg2 = isConstant(inSets[I], call->getArgOperand(2));
 
             if (arg1 && arg2) {
               ConstantInt *const1 = cast<ConstantInt>(arg1);
@@ -257,22 +339,12 @@ namespace {
 
               builder.CreateCall(currentModule->getFunction("CAT_set"), {call->getArgOperand(0), sum});
 
-              toDelete.push_back(&I);
+              toDelete.push_back(I);
               modified = true;
-            } else if (arg1) {
-              ConstantInt *const1 = cast<ConstantInt>(arg1);
-              if (const1->getSExtValue() == 0) {
-                toSimplify[&I] = call->getArgOperand(2);
-              }
-            } else if (arg2) {
-              ConstantInt *const2 = cast<ConstantInt>(arg2);
-              if (const2->getSExtValue() == 0) {
-                toSimplify[&I] = call->getArgOperand(1);
-              }
             }
           } else if (currentModule->getFunction("CAT_sub") == callee) {
-            Value* arg1 = isConstant(inSets[&I], call->getArgOperand(1));
-            Value* arg2 = isConstant(inSets[&I], call->getArgOperand(2));
+            Value* arg1 = isConstant(inSets[I], call->getArgOperand(1));
+            Value* arg2 = isConstant(inSets[I], call->getArgOperand(2));
 
             if (arg1 && arg2) {
               ConstantInt *const1 = cast<ConstantInt>(arg1);
@@ -283,13 +355,8 @@ namespace {
 
               builder.CreateCall(currentModule->getFunction("CAT_set"), {call->getArgOperand(0), diff});
 
-              toDelete.push_back(&I);
+              toDelete.push_back(I);
               modified = true;
-            } else if (arg2) {
-              ConstantInt *const2 = cast<ConstantInt>(arg2);
-              if (const2->getSExtValue() == 0) {
-                toSimplify[&I] = call->getArgOperand(1);
-              }
             }
           }
         }
@@ -298,24 +365,90 @@ namespace {
       for (auto I : toDelete) {
         I->eraseFromParent();
       }
-      toDelete.clear();
-      
-      // Algebraic simplification
-      for (auto [I, variable] : toSimplify) {
+
+      return modified;
+    }
+
+    bool runAlgebraicSimplification(std::map<Instruction *, std::set<Instruction *>> inSets,
+                                    std::map<Instruction *,std::set<Instruction *>> outSets,
+                                    std::set<Instruction *> CATInstructions) {
+      bool modified = false;
+      std::vector<Instruction *> toDelete;
+
+      for (auto I : CATInstructions) {
         if (CallInst *call = dyn_cast<CallInst>(I)) {
           IRBuilder<> builder(call);
 
-          Value *catGet = builder.CreateCall(currentModule->getFunction("CAT_get"), {variable});
-          builder.CreateCall(currentModule->getFunction("CAT_set"), {call->getArgOperand(0), catGet});
+          Function *callee = call->getCalledFunction();
+          if (currentModule->getFunction("CAT_add") == callee) {
+            if (Value *arg = isConstant(inSets[I], call->getArgOperand(1))) {
+              ConstantInt *c = cast<ConstantInt>(arg);
+              
+              if (c->getSExtValue() == 0) {
+                Value *catGet = builder.CreateCall(currentModule->getFunction("CAT_get"), {call->getArgOperand(2)});
+                builder.CreateCall(currentModule->getFunction("CAT_set"), {call->getArgOperand(0), catGet});
 
-          toDelete.push_back(I);
-          modified = true;
+                toDelete.push_back(I);
+                modified = true;
+              }
+            } else if (Value *arg = isConstant(inSets[I], call->getArgOperand(2))) {
+              ConstantInt *c = cast<ConstantInt>(arg);
+
+              if (c->getSExtValue() == 0) {
+                Value *catGet = builder.CreateCall(currentModule->getFunction("CAT_get"), {call->getArgOperand(1)});
+                builder.CreateCall(currentModule->getFunction("CAT_set"), {call->getArgOperand(0), catGet});
+
+                toDelete.push_back(I);
+                modified = true;
+              }
+            }
+          } else if (currentModule->getFunction("CAT_sub") == callee) {
+            if (Value *arg = isConstant(inSets[I], call->getArgOperand(2))) {
+              ConstantInt *c = cast<ConstantInt>(arg);
+
+              if (c->getSExtValue() == 0) {
+                Value *catGet = builder.CreateCall(currentModule->getFunction("CAT_get"), {call->getArgOperand(1)});
+                builder.CreateCall(currentModule->getFunction("CAT_set"), {call->getArgOperand(0), catGet});
+                
+                toDelete.push_back(I);
+                modified = true;
+              }
+            } else if (call->getArgOperand(1) == call->getArgOperand(2)) {
+              Value *zeroConst = ConstantInt::get(IntegerType::get(currentModule->getContext(), 64), 0, true);
+              builder.CreateCall(currentModule->getFunction("CAT_set"), {call->getArgOperand(0), zeroConst});
+
+              toDelete.push_back(I);
+              modified = true;
+            }
+          }
         }
       }
 
       for (auto I : toDelete) {
         I->eraseFromParent();
       }
+
+      return modified;
+    }
+
+    // This function is invoked once per function compiled
+    // The LLVM IR of the input functions is ready and it can be analyzed and/or transformed
+    bool runOnFunction (Function &F) override {
+      bool modified = false;
+      std::map<Instruction *, std::set<Instruction *>> inSets;
+      std::map<Instruction *, std::set<Instruction *>> outSets;
+      std::set<Instruction *> CATInstructions;
+      createReachingDefs(F, inSets, outSets);
+      getCatInstructions(F, CATInstructions);
+
+      // Constant propagation
+      modified |= runConstantPropagation(inSets, outSets, CATInstructions);
+
+      // Constant folding
+      modified |= runConstantFolding(inSets, outSets, CATInstructions);
+
+      // Algebraic Simplification
+      modified |= runAlgebraicSimplification(inSets, outSets, CATInstructions);
 
       return modified;
     }
