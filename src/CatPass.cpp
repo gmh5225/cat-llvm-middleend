@@ -11,7 +11,6 @@
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/Transforms/IPO/PassManagerBuilder.h"
 #include "llvm/Transforms/Utils/BasicBlockUtils.h"
-#include <deque>
 #include <map>
 #include <set>
 #include <vector>
@@ -140,12 +139,12 @@ namespace {
         }
       }
 
-      BitVector workList = BitVector(size);
-      workList.set();
+      BitVector workList = BitVector(size, true);
 
-      while (!workList.none()) {
+      while (workList.any()) {
         int first = workList.find_first();
         workList.reset(first);
+
         Instruction *inst = numToInst[first];
         BitVector oldOut = out[inst];
         Instruction *prev = inst->getPrevNode();
@@ -278,7 +277,7 @@ namespace {
               case CAT_set:
                 if (v == call->getArgOperand(0)) {
                   if (ConstantInt *constant = dyn_cast<ConstantInt>(call->getArgOperand(1))) {
-                    if (!initialized) {
+                    if (!initialized || isa<PHINode>(v)) {
                       valPtr = call->getArgOperand(1);
                       c = constant->getSExtValue();
                       initialized = true;
@@ -300,7 +299,7 @@ namespace {
 
     bool runConstantPropagation(std::map<Instruction *, std::set<Instruction *>> inSets,
                                 std::map<Instruction *,std::set<Instruction *>> outSets,
-                                std::set<Instruction *> CATInstructions) {
+                                std::set<Instruction *> &CATInstructions) {
       bool modified = false;
       std::map<Instruction *, Value *> toReplace;
 
@@ -319,6 +318,7 @@ namespace {
       for (auto [I, constValue] : toReplace) {
         BasicBlock::iterator ii(I);
         ReplaceInstWithValue(I->getParent()->getInstList(), ii, constValue);
+        CATInstructions.erase(I);
       }
 
       return modified;
@@ -326,7 +326,7 @@ namespace {
 
     bool runConstantFolding(std::map<Instruction *, std::set<Instruction *>> inSets,
                             std::map<Instruction *,std::set<Instruction *>> outSets,
-                            std::set<Instruction *> CATInstructions) {
+                            std::set<Instruction *> &CATInstructions) {
       bool modified = false;
       std::vector<Instruction *> toDelete;
 
@@ -346,7 +346,8 @@ namespace {
               IntegerType *intType = IntegerType::get(currentModule->getContext(), 64);
               Value *sum = ConstantInt::get(intType, const1->getSExtValue() + const2->getSExtValue(), true);
 
-              builder.CreateCall(currentModule->getFunction("CAT_set"), {call->getArgOperand(0), sum});
+              Instruction *newInst = builder.CreateCall(currentModule->getFunction("CAT_set"), {call->getArgOperand(0), sum});
+              CATInstructions.insert(newInst);
 
               toDelete.push_back(I);
               modified = true;
@@ -362,7 +363,8 @@ namespace {
               IntegerType *intType = IntegerType::get(currentModule->getContext(), 64);
               Value *diff = ConstantInt::get(intType, const1->getSExtValue() - const2->getSExtValue(), true);
 
-              builder.CreateCall(currentModule->getFunction("CAT_set"), {call->getArgOperand(0), diff});
+              Instruction *newInst = builder.CreateCall(currentModule->getFunction("CAT_set"), {call->getArgOperand(0), diff});
+              CATInstructions.insert(newInst);
 
               toDelete.push_back(I);
               modified = true;
@@ -373,6 +375,7 @@ namespace {
 
       for (auto I : toDelete) {
         I->eraseFromParent();
+        CATInstructions.erase(I);
       }
 
       return modified;
@@ -380,7 +383,7 @@ namespace {
 
     bool runAlgebraicSimplification(std::map<Instruction *, std::set<Instruction *>> inSets,
                                     std::map<Instruction *,std::set<Instruction *>> outSets,
-                                    std::set<Instruction *> CATInstructions) {
+                                    std::set<Instruction *> &CATInstructions) {
       bool modified = false;
       std::vector<Instruction *> toDelete;
 
@@ -394,8 +397,10 @@ namespace {
               ConstantInt *c = cast<ConstantInt>(arg);
               
               if (c->getSExtValue() == 0) {
-                Value *catGet = builder.CreateCall(currentModule->getFunction("CAT_get"), {call->getArgOperand(2)});
-                builder.CreateCall(currentModule->getFunction("CAT_set"), {call->getArgOperand(0), catGet});
+                Instruction *catGet = builder.CreateCall(currentModule->getFunction("CAT_get"), {call->getArgOperand(2)});
+                Instruction *newInst = builder.CreateCall(currentModule->getFunction("CAT_set"), {call->getArgOperand(0), catGet});
+                CATInstructions.insert(catGet);
+                CATInstructions.insert(newInst);
 
                 toDelete.push_back(I);
                 modified = true;
@@ -404,8 +409,10 @@ namespace {
               ConstantInt *c = cast<ConstantInt>(arg);
 
               if (c->getSExtValue() == 0) {
-                Value *catGet = builder.CreateCall(currentModule->getFunction("CAT_get"), {call->getArgOperand(1)});
-                builder.CreateCall(currentModule->getFunction("CAT_set"), {call->getArgOperand(0), catGet});
+                Instruction *catGet = builder.CreateCall(currentModule->getFunction("CAT_get"), {call->getArgOperand(1)});
+                Instruction *newInst = builder.CreateCall(currentModule->getFunction("CAT_set"), {call->getArgOperand(0), catGet});
+                CATInstructions.insert(catGet);
+                CATInstructions.insert(newInst);
 
                 toDelete.push_back(I);
                 modified = true;
@@ -416,15 +423,18 @@ namespace {
               ConstantInt *c = cast<ConstantInt>(arg);
 
               if (c->getSExtValue() == 0) {
-                Value *catGet = builder.CreateCall(currentModule->getFunction("CAT_get"), {call->getArgOperand(1)});
-                builder.CreateCall(currentModule->getFunction("CAT_set"), {call->getArgOperand(0), catGet});
+                Instruction *catGet = builder.CreateCall(currentModule->getFunction("CAT_get"), {call->getArgOperand(1)});
+                Instruction *newInst = builder.CreateCall(currentModule->getFunction("CAT_set"), {call->getArgOperand(0), catGet});
+                CATInstructions.insert(catGet);
+                CATInstructions.insert(newInst);
                 
                 toDelete.push_back(I);
                 modified = true;
               }
             } else if (call->getArgOperand(1) == call->getArgOperand(2)) {
               Value *zeroConst = ConstantInt::get(IntegerType::get(currentModule->getContext(), 64), 0, true);
-              builder.CreateCall(currentModule->getFunction("CAT_set"), {call->getArgOperand(0), zeroConst});
+              Instruction *newInst = builder.CreateCall(currentModule->getFunction("CAT_set"), {call->getArgOperand(0), zeroConst});
+              CATInstructions.insert(newInst);
 
               toDelete.push_back(I);
               modified = true;
@@ -435,6 +445,7 @@ namespace {
 
       for (auto I : toDelete) {
         I->eraseFromParent();
+        CATInstructions.erase(I);
       }
 
       return modified;
@@ -454,9 +465,19 @@ namespace {
       modified |= runConstantPropagation(inSets, outSets, CATInstructions);
 
       // Constant folding
+      if (modified) {
+        inSets.clear();
+        outSets.clear();
+        createReachingDefs(F, inSets, outSets);
+      }
       modified |= runConstantFolding(inSets, outSets, CATInstructions);
 
       // Algebraic Simplification
+      if (modified) {
+        inSets.clear();
+        outSets.clear();
+        createReachingDefs(F, inSets, outSets);
+      }
       modified |= runAlgebraicSimplification(inSets, outSets, CATInstructions);
 
       return modified;
