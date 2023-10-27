@@ -106,7 +106,7 @@ namespace {
                 defTable[inst].insert(userCall);
               }
             } else if (StoreInst *userStore = dyn_cast<StoreInst>(user)) {
-              defTable[inst].insert(userStore);
+              // defTable[inst].insert(userStore);
             }
           }
         }
@@ -121,7 +121,8 @@ namespace {
     void createReachingDefs(Function &F, 
                             std::map<Instruction *, std::set<Instruction *>> &inSets, 
                             std::map<Instruction *, std::set<Instruction *>> &outSets,
-                            std::set<Instruction *> CATInstructions) {
+                            std::set<Instruction *> CATInstructions,
+                            std::map<Instruction *, std::set<Instruction *>> defTable) {
       std::vector<Instruction *> numToInst;
       std::map<Instruction *, unsigned> instToNum;
       std::map<Instruction *, BitVector> gen;
@@ -129,17 +130,7 @@ namespace {
       std::vector<std::vector<Instruction *>> toKill;
       std::map<Instruction *, BitVector> in;
       std::map<Instruction *, BitVector> out;
-      std::vector<Instruction *> buffer;
-      std::map<Instruction *, std::set<Instruction *>> defTable;
       std::set<Instruction *> escaped;
-
-      createDefTable(CATInstructions, defTable);
-      // for (auto [D, S] : defTable) {
-      //   errs() << "=====" << *D << "\n";
-      //   for (auto N : S) {
-      //     errs() << *N << "\n";
-      //   }
-      // }
 
       // Initialize the unsigned size to be the total number of instructions in F
       // The unsigned num represents the number (temporarily) assigned to an
@@ -169,7 +160,6 @@ namespace {
               case CAT_add:
               case CAT_sub:
               case CAT_set:
-                // genSet.set(num);
                 if (Instruction *arg = dyn_cast<Instruction>(call->getArgOperand(0))) {
                   if (!escaped.contains(arg)) {
                     genSet.set(num);
@@ -185,6 +175,7 @@ namespace {
             for (auto [def, insts] : defTable) {
               if (insts.contains(&I)) {
                 escaped.insert(def);
+                genSet.set(num);
                 std::vector<Instruction *> pair = {&I, def};
                 toKill.push_back(pair);
               }
@@ -195,12 +186,6 @@ namespace {
             std::vector<Instruction *> pair = {&I, val};
             toKill.push_back(pair);
           }
-        } else if (isa<LoadInst>(&I)) {
-          for (auto buff : buffer) {
-            std::vector<Instruction *> pair = {&I, buff};
-            toKill.push_back(pair);
-          }
-          buffer.clear();
         }
 
         gen[&I] = genSet;
@@ -305,25 +290,12 @@ namespace {
     // It returns a pointer to the ConstantInt if it is a constant
     // Otherwise, it returns a nullptr
     ConstantInt *isConstant(std::set<Instruction *> inSet, 
-                            Value *valToCheck, 
-                            Instruction *I) {
+                            Value *valToCheck,
+                            std::map<Instruction *, std::set<Instruction *>> defTable) {
       // If the value is an argument, it is not safe to assume it is a constant
-      if (isa<Argument>(valToCheck)) {
+      if (isa<Argument>(valToCheck) || isa<LoadInst>(valToCheck)) {
         return nullptr;
       }
-
-      /* // Look through the def-use chain of valToCheck
-      for (auto user : valToCheck->users()) {
-        if (Instruction *inst = dyn_cast<Instruction>(user)) {
-          if (CallInst *call = dyn_cast<CallInst>(inst)) {
-            Function *callee = call->getCalledFunction();
-            // If user is not a CAT function, then valToCheck might escape
-            if (!CATMap.contains(callee)) {
-              return nullptr;
-            }
-          }
-        }
-      } */
 
       ConstantInt *constPtr = nullptr;
       int64_t constant;
@@ -345,7 +317,7 @@ namespace {
             continue;
           }
 
-          if (ConstantInt *constInt = isConstant(inSet, phiVal, I)) {
+          if (ConstantInt *constInt = isConstant(inSet, phiVal, defTable)) {
             if (!initialized) {
               phiConst = constInt;
               constant = constInt->getSExtValue();
@@ -406,18 +378,25 @@ namespace {
               default:
                 break;
             }
+          } else {
+            if (Instruction *valInst = dyn_cast<Instruction>(valToCheck)) {
+              if (defTable.contains(valInst) && defTable.at(valInst).contains(inst)) {
+                return nullptr;
+              }
+            }
           }
         }
       }
       
-      // Operations performed on the PHI take precedence over PHI values
+      // Operations performed on the PHI take precedence over incoming values
       return constPtr ? constPtr : phiConst;
     }
 
     // This function runs constant propagation on a set of CAT instruction
     bool runConstantPropagation(std::map<Instruction *, std::set<Instruction *>> inSets,
                                 std::map<Instruction *,std::set<Instruction *>> outSets,
-                                std::set<Instruction *> &CATInstructions) {
+                                std::set<Instruction *> &CATInstructions,
+                                std::map<Instruction *, std::set<Instruction *>> defTable) {
       bool modified = false;
       std::map<Instruction *, ConstantInt *> toReplace;
 
@@ -425,7 +404,7 @@ namespace {
         if (CallInst *call = dyn_cast<CallInst>(I)) {
           Function *callee = call->getCalledFunction();
           if (currentModule->getFunction("CAT_get") == callee) {
-            if (ConstantInt *c = isConstant(inSets[I], call->getArgOperand(0), I)) {
+            if (ConstantInt *c = isConstant(inSets[I], call->getArgOperand(0), defTable)) {
               toReplace[I] = c;
               modified = true;
             }
@@ -445,7 +424,8 @@ namespace {
     // This function runs constant folding on a set of CAT instructions
     bool runConstantFolding(std::map<Instruction *, std::set<Instruction *>> inSets,
                             std::map<Instruction *,std::set<Instruction *>> outSets,
-                            std::set<Instruction *> &CATInstructions) {
+                            std::set<Instruction *> &CATInstructions,
+                            std::map<Instruction *, std::set<Instruction *>> defTable) {
       bool modified = false;
       std::vector<Instruction *> toDelete;
 
@@ -455,8 +435,8 @@ namespace {
           
           Function *callee = call->getCalledFunction();
           if (currentModule->getFunction("CAT_add") == callee) {
-            ConstantInt *const1 = isConstant(inSets[I], call->getArgOperand(1), I);
-            ConstantInt *const2 = isConstant(inSets[I], call->getArgOperand(2), I);
+            ConstantInt *const1 = isConstant(inSets[I], call->getArgOperand(1), defTable);
+            ConstantInt *const2 = isConstant(inSets[I], call->getArgOperand(2), defTable);
 
             if (const1 && const2) {
               IntegerType *intType = IntegerType::get(currentModule->getContext(), 64);
@@ -469,8 +449,8 @@ namespace {
               modified = true;
             }
           } else if (currentModule->getFunction("CAT_sub") == callee) {
-            ConstantInt *const1 = isConstant(inSets[I], call->getArgOperand(1), I);
-            ConstantInt *const2 = isConstant(inSets[I], call->getArgOperand(2), I);
+            ConstantInt *const1 = isConstant(inSets[I], call->getArgOperand(1), defTable);
+            ConstantInt *const2 = isConstant(inSets[I], call->getArgOperand(2), defTable);
 
             if (const1 && const2) {
               IntegerType *intType = IntegerType::get(currentModule->getContext(), 64);
@@ -497,7 +477,8 @@ namespace {
     // This function runs algebraic simplification on a set of CAT instructions
     bool runAlgebraicSimplification(std::map<Instruction *, std::set<Instruction *>> inSets,
                                     std::map<Instruction *,std::set<Instruction *>> outSets,
-                                    std::set<Instruction *> &CATInstructions) {
+                                    std::set<Instruction *> &CATInstructions,
+                                    std::map<Instruction *, std::set<Instruction *>> defTable) {
       bool modified = false;
       std::vector<Instruction *> toDelete;
 
@@ -507,7 +488,7 @@ namespace {
 
           Function *callee = call->getCalledFunction();
           if (currentModule->getFunction("CAT_add") == callee) {
-            if (ConstantInt *c = isConstant(inSets[I], call->getArgOperand(1), I)) {
+            if (ConstantInt *c = isConstant(inSets[I], call->getArgOperand(1), defTable)) {
               // If the 2nd argument is a constant = 0, then simplify to 3rd argument
               if (c->getSExtValue() == 0) {
                 Instruction *catGet = builder.CreateCall(currentModule->getFunction("CAT_get"), {call->getArgOperand(2)});
@@ -518,7 +499,7 @@ namespace {
                 toDelete.push_back(I);
                 modified = true;
               }
-            } else if (ConstantInt *c = isConstant(inSets[I], call->getArgOperand(2), I)) {
+            } else if (ConstantInt *c = isConstant(inSets[I], call->getArgOperand(2), defTable)) {
               // If the 3rd argument is a constant = 0, then simplify to 2nd argument
               if (c->getSExtValue() == 0) {
                 Instruction *catGet = builder.CreateCall(currentModule->getFunction("CAT_get"), {call->getArgOperand(1)});
@@ -531,7 +512,7 @@ namespace {
               }
             }
           } else if (currentModule->getFunction("CAT_sub") == callee) {
-            if (ConstantInt *c = isConstant(inSets[I], call->getArgOperand(2), I)) {
+            if (ConstantInt *c = isConstant(inSets[I], call->getArgOperand(2), defTable)) {
               // If the 3rd argument is a constant = 0, then simplify to 2nd argument
               if (c->getSExtValue() == 0) {
                 Instruction *catGet = builder.CreateCall(currentModule->getFunction("CAT_get"), {call->getArgOperand(1)});
@@ -563,6 +544,18 @@ namespace {
       return modified;
     }
 
+    void regenerateDataStructs(Function &F,
+                               std::map<Instruction *, std::set<Instruction *>> &inSets,
+                               std::map<Instruction *, std::set<Instruction *>> &outSets,
+                               std::set<Instruction *> CATInstructions,
+                               std::map<Instruction *, std::set<Instruction *>> &defTable) {
+      inSets.clear();
+      outSets.clear();
+      defTable.clear();
+      createDefTable(CATInstructions, defTable);
+      createReachingDefs(F, inSets, outSets, CATInstructions, defTable);
+    }
+
     // This function is invoked once per function compiled
     // The LLVM IR of the input functions is ready and it can be analyzed and/or transformed
     bool runOnFunction (Function &F) override {
@@ -570,29 +563,26 @@ namespace {
       std::map<Instruction *, std::set<Instruction *>> inSets;
       std::map<Instruction *, std::set<Instruction *>> outSets;
       std::set<Instruction *> CATInstructions;
+      std::map<Instruction *, std::set<Instruction *>> defTable;
       getCatInstructions(F, CATInstructions);
-      createReachingDefs(F, inSets, outSets, CATInstructions);
+      regenerateDataStructs(F, inSets, outSets, CATInstructions, defTable);
 
       printReachingDefs(F, inSets, outSets);
 
       // Constant propagation
-      modified |= runConstantPropagation(inSets, outSets, CATInstructions);
+      modified |= runConstantPropagation(inSets, outSets, CATInstructions, defTable);
 
       // Constant folding
       if (modified) {
-        inSets.clear();
-        outSets.clear();
-        createReachingDefs(F, inSets, outSets, CATInstructions);
+        regenerateDataStructs(F, inSets, outSets, CATInstructions, defTable);
       }
-      modified |= runConstantFolding(inSets, outSets, CATInstructions);
+      modified |= runConstantFolding(inSets, outSets, CATInstructions, defTable);
 
       // Algebraic Simplification
       if (modified) {
-        inSets.clear();
-        outSets.clear();
-        createReachingDefs(F, inSets, outSets, CATInstructions);
+        regenerateDataStructs(F, inSets, outSets, CATInstructions, defTable);
       }
-      modified |= runAlgebraicSimplification(inSets, outSets, CATInstructions);
+      modified |= runAlgebraicSimplification(inSets, outSets, CATInstructions, defTable);
 
       return modified;
     }
