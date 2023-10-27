@@ -47,6 +47,15 @@ namespace {
       return false;
     }
 
+    // This function prints the definitions for a variable in the style of H0
+    void printDefTable(Function &F, std::map<Instruction *, std::set<Instruction *>> defTable) {
+      for (auto [def, insts] : defTable) {
+        for (auto inst : insts) {
+          errs() << F.getName() << *def << *inst << "\n";
+        }
+      }
+    }
+
     // This function prints the reaching definitions for a function F in the style
     // of H1
     void printReachingDefs(Function &F,
@@ -81,6 +90,9 @@ namespace {
 
     void createDefTable(std::set<Instruction *> CATInstructions, 
                         std::map<Instruction *, std::set<Instruction *>> &defTable) {
+      std::set<Instruction *> escaped;
+      std::set<Instruction *> functions;
+
       for (auto inst : CATInstructions) {
         CallInst *call = cast<CallInst>(inst);
         if (currentModule->getFunction("CAT_new") == call->getCalledFunction()) {
@@ -103,14 +115,20 @@ namespace {
                     break;
                 }
               } else {
-                defTable[inst].insert(userCall);
+                escaped.insert(inst);
+                functions.insert(userCall);
               }
-            } else if (StoreInst *userStore = dyn_cast<StoreInst>(user)) {
-              // defTable[inst].insert(userStore);
             }
           }
         }
       }
+
+      for (auto esc : escaped) {
+        for (auto fun : functions) {
+          defTable[esc].insert(fun);
+        }
+      }
+
       return;
     }
 
@@ -567,7 +585,8 @@ namespace {
       getCatInstructions(F, CATInstructions);
       regenerateDataStructs(F, inSets, outSets, CATInstructions, defTable);
 
-      printReachingDefs(F, inSets, outSets);
+      printDefTable(F, defTable);
+      // printReachingDefs(F, inSets, outSets);
 
       // Constant propagation
       modified |= runConstantPropagation(inSets, outSets, CATInstructions, defTable);
