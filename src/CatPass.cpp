@@ -1,5 +1,6 @@
 #include "llvm/Pass.h"
 #include "llvm/ADT/BitVector.h"
+#include "llvm/Analysis/AliasAnalysis.h"
 #include "llvm/IR/BasicBlock.h"
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/Function.h"
@@ -47,7 +48,7 @@ namespace {
       return false;
     }
 
-    // This function prints the definitions for a variable in the style of H0
+    // This function prints the definitions of a variable
     void printDefTable(Function &F, std::map<Instruction *, std::set<Instruction *>> defTable) {
       for (auto [def, insts] : defTable) {
         for (auto inst : insts) {
@@ -56,8 +57,7 @@ namespace {
       }
     }
 
-    // This function prints the reaching definitions for a function F in the style
-    // of H1
+    // This function prints the reaching definitions of a function F
     void printReachingDefs(Function &F,
                            std::map<Instruction *, std::set<Instruction *>> inSets, 
                            std::map<Instruction *, std::set<Instruction *>> outSets) {
@@ -88,10 +88,44 @@ namespace {
       }
     }
 
+    void getPointerUsers(Value *pointer,
+                         std::vector<Instruction *> &calls,
+                         std::set<Value *> &seen) {
+      for (auto user : pointer->users()) {
+        if (!seen.contains(user)) {
+          seen.insert(user);
+
+          if (CallInst *call = dyn_cast<CallInst>(user)) {
+            Function *callee = call->getCalledFunction();
+            if (CATMap.contains(callee)) {
+              switch (CATMap.at(callee)) {
+                case CAT_add:
+                case CAT_sub:
+                case CAT_set:
+                  if (call->getArgOperand(0) == pointer) {
+                    calls.push_back(call);
+                  }
+                  break;
+                default:
+                  break;
+              }
+            } else {
+              calls.push_back(call);
+            }
+          } else if (StoreInst *store = dyn_cast<StoreInst>(user)) {
+            getPointerUsers(store->getPointerOperand(), calls, seen);
+          } else if (isa<PHINode>(user) || isa<SelectInst>(user) || isa<LoadInst>(user)) {
+            getPointerUsers(user, calls, seen);
+          }
+        }
+        
+      }
+    }
+
     void createDefTable(std::set<Instruction *> CATInstructions, 
                         std::map<Instruction *, std::set<Instruction *>> &defTable) {
-      std::set<Instruction *> escaped;
-      std::set<Instruction *> functions;
+      std::vector<Instruction *> escaped;
+      std::vector<Instruction *> calls;
 
       for (auto inst : CATInstructions) {
         CallInst *call = cast<CallInst>(inst);
@@ -115,21 +149,35 @@ namespace {
                     break;
                 }
               } else {
-                escaped.insert(inst);
-                functions.insert(userCall);
+                escaped.push_back(inst);
+                calls.push_back(userCall);
               }
+            } else if (StoreInst *store = dyn_cast<StoreInst>(user)) {
+              escaped.push_back(inst);
+              std::set<Value *> seen = {user};
+              getPointerUsers(store->getPointerOperand(), calls, seen);
             }
           }
         }
       }
 
-      for (auto esc : escaped) {
-        for (auto fun : functions) {
-          defTable[esc].insert(fun);
+      for (auto var : escaped) {
+        for (auto call : calls) {
+          defTable[var].insert(call);
         }
       }
+    }
 
-      return;
+    unsigned assignNumbers(Function &F, 
+                           std::vector<Instruction *> &numToInst, 
+                           std::map<Instruction *, unsigned> &instToNum) {
+      unsigned num = 0;
+      for (auto &I : instructions(F)) {
+        numToInst.push_back(&I);
+        instToNum[&I] = num;
+        num++;
+      }
+      return num;
     }
 
     // This function creates reaching definitons for all instructions in function F
@@ -139,48 +187,42 @@ namespace {
     void createReachingDefs(Function &F, 
                             std::map<Instruction *, std::set<Instruction *>> &inSets, 
                             std::map<Instruction *, std::set<Instruction *>> &outSets,
-                            std::set<Instruction *> CATInstructions,
-                            std::map<Instruction *, std::set<Instruction *>> defTable) {
+                            std::map<Instruction *, std::set<Instruction *>> defTable,
+                            AliasAnalysis &aliasAnalysis) {
       std::vector<Instruction *> numToInst;
       std::map<Instruction *, unsigned> instToNum;
+      unsigned size = assignNumbers(F, numToInst, instToNum);
+
       std::map<Instruction *, BitVector> gen;
       std::map<Instruction *, BitVector> kill;
-      std::vector<std::vector<Instruction *>> toKill;
       std::map<Instruction *, BitVector> in;
       std::map<Instruction *, BitVector> out;
-      std::set<Instruction *> escaped;
 
-      // Initialize the unsigned size to be the total number of instructions in F
-      // The unsigned num represents the number (temporarily) assigned to an
-      // instruction for reference
-      unsigned num = 0;
-      unsigned size = 0;
-      for (auto &B : F) {
-        size += B.size();
-      }
+      std::vector<std::vector<Instruction *>> toKill;
+      std::set<Instruction *> escaped;
 
       // Generate the gen sets
       for (auto &I : instructions(F)) {
-        numToInst.push_back(&I);
-        instToNum[&I] = num;
-        in[&I] = BitVector(size);
-        out[&I] = BitVector(size);
-        BitVector genSet = BitVector(size);
-        BitVector killSet = BitVector(size);
-        
+        gen[&I] = BitVector(size);
+        kill[&I] = BitVector(size);      
+
         if (CallInst *call = dyn_cast<CallInst>(&I)) {
           Function *callee = call->getCalledFunction();
           if (CATMap.contains(callee)) {
             switch (CATMap.at(callee)) {
               case CAT_new:
-                genSet.set(num);
+                gen[&I].set(instToNum.at(&I));
+                for (auto def : defTable.at(&I)) {
+                  kill[&I].set(instToNum.at(def));
+                }
+                kill[&I].reset(instToNum.at(&I));
                 break;
               case CAT_add:
               case CAT_sub:
               case CAT_set:
                 if (Instruction *arg = dyn_cast<Instruction>(call->getArgOperand(0))) {
                   if (!escaped.contains(arg)) {
-                    genSet.set(num);
+                    gen[&I].set(instToNum.at(&I));
                     std::vector<Instruction *> pair = {&I, arg};
                     toKill.push_back(pair);
                   }
@@ -191,24 +233,23 @@ namespace {
             }
           } else {
             for (auto [def, insts] : defTable) {
-              if (insts.contains(&I)) {
+              if (insts.contains(&I) && !escaped.contains(def)) {
                 escaped.insert(def);
-                genSet.set(num);
+                gen[&I].set(instToNum.at(&I));
                 std::vector<Instruction *> pair = {&I, def};
                 toKill.push_back(pair);
               }
             }
           }
         } else if (StoreInst *store = dyn_cast<StoreInst>(&I)) {
-          if (CallInst *val = dyn_cast<CallInst>(store->getValueOperand())) {
+          if (Instruction *val = dyn_cast<Instruction>(store->getValueOperand())) {
             std::vector<Instruction *> pair = {&I, val};
             toKill.push_back(pair);
           }
         }
 
-        gen[&I] = genSet;
-        kill[&I] = killSet;
-        num++;
+        in[&I] = BitVector(size);
+        out[&I] = BitVector(size);
       }
 
       // Generate the kill sets
@@ -228,8 +269,9 @@ namespace {
         workList.reset(first);
 
         Instruction *inst = numToInst[first];
+        BitVector oldOut = out[inst];
+
         Instruction *prev = inst->getPrevNode();
-        
         if (!prev) {
           for (auto pred : predecessors(inst->getParent())) {
             in[inst] |= out[pred->getTerminator()];
@@ -238,12 +280,11 @@ namespace {
           in[inst] |= out[prev];
         }
 
-        BitVector newOut = BitVector(size);
-        newOut |= in[inst];
-        newOut.reset(kill[inst]);
-        newOut |= gen[inst];
+        out[inst] |= in[inst];
+        out[inst].reset(kill[inst]);
+        out[inst] |= gen[inst];
 
-        if (newOut != out[inst]) {
+        if (oldOut != out[inst]) {
           Instruction *next = inst->getNextNode();
           if (!next) {
             for (auto succ : successors(inst->getParent())) {
@@ -253,8 +294,6 @@ namespace {
             workList.set(instToNum[next]);
           }
         }
-
-        out[inst] = newOut;
       }
 
       // Convert BitVectors to sets and insert them into inSets and outSets
@@ -278,9 +317,8 @@ namespace {
     // This function runs DFS to check if there is a cycle when 
     // traversing the incoming values in a PHI node
     bool containsCycle(Value *v) {
-      std::vector<Value *> stack;
+      std::vector<Value *> stack = {v};
       std::set<Value *> visited;
-      stack.push_back(v);
 
       while (!stack.empty()) {
         Value *val = stack.back();
@@ -311,7 +349,7 @@ namespace {
                             Value *valToCheck,
                             std::map<Instruction *, std::set<Instruction *>> defTable) {
       // If the value is an argument, it is not safe to assume it is a constant
-      if (isa<Argument>(valToCheck) || isa<LoadInst>(valToCheck)) {
+      if (isa<Argument>(valToCheck)) {
         return nullptr;
       }
 
@@ -566,12 +604,13 @@ namespace {
                                std::map<Instruction *, std::set<Instruction *>> &inSets,
                                std::map<Instruction *, std::set<Instruction *>> &outSets,
                                std::set<Instruction *> CATInstructions,
-                               std::map<Instruction *, std::set<Instruction *>> &defTable) {
+                               std::map<Instruction *, std::set<Instruction *>> &defTable,
+                               AliasAnalysis &aliasAnalysis) {
       inSets.clear();
       outSets.clear();
       defTable.clear();
       createDefTable(CATInstructions, defTable);
-      createReachingDefs(F, inSets, outSets, CATInstructions, defTable);
+      createReachingDefs(F, inSets, outSets, defTable, aliasAnalysis);
     }
 
     // This function is invoked once per function compiled
@@ -582,24 +621,25 @@ namespace {
       std::map<Instruction *, std::set<Instruction *>> outSets;
       std::set<Instruction *> CATInstructions;
       std::map<Instruction *, std::set<Instruction *>> defTable;
+      AliasAnalysis &aliasAnalysis = getAnalysis<AAResultsWrapperPass>().getAAResults();
       getCatInstructions(F, CATInstructions);
-      regenerateDataStructs(F, inSets, outSets, CATInstructions, defTable);
+      regenerateDataStructs(F, inSets, outSets, CATInstructions, defTable, aliasAnalysis);
 
-      printDefTable(F, defTable);
-      // printReachingDefs(F, inSets, outSets);
+      // printDefTable(F, defTable);
+      printReachingDefs(F, inSets, outSets);
 
       // Constant propagation
       modified |= runConstantPropagation(inSets, outSets, CATInstructions, defTable);
 
       // Constant folding
       if (modified) {
-        regenerateDataStructs(F, inSets, outSets, CATInstructions, defTable);
+        regenerateDataStructs(F, inSets, outSets, CATInstructions, defTable, aliasAnalysis);
       }
       modified |= runConstantFolding(inSets, outSets, CATInstructions, defTable);
 
       // Algebraic Simplification
       if (modified) {
-        regenerateDataStructs(F, inSets, outSets, CATInstructions, defTable);
+        regenerateDataStructs(F, inSets, outSets, CATInstructions, defTable, aliasAnalysis);
       }
       modified |= runAlgebraicSimplification(inSets, outSets, CATInstructions, defTable);
 
@@ -608,7 +648,9 @@ namespace {
 
     // We don't modify the program, so we preserve all analyses.
     // The LLVM IR of functions isn't ready at this point
-    void getAnalysisUsage(AnalysisUsage &AU) const override { }
+    void getAnalysisUsage(AnalysisUsage &AU) const override {
+      AU.addRequired<AAResultsWrapperPass>();
+    }
   };
 }
 
