@@ -181,7 +181,7 @@ namespace {
 
       for (auto store : stores) {
         for (auto load : loads) {
-          if (Instruction *stored = dyn_cast<Instruction>(store->getValueOperand())) {
+          if (CallInst *stored = dyn_cast<CallInst>(store->getValueOperand())) {
             switch (aliasAnalysis.alias(MemoryLocation::get(store), MemoryLocation::get(load))) {
               case AliasResult::MayAlias:
               case AliasResult::PartialAlias:
@@ -224,7 +224,6 @@ namespace {
       kill[killer].insert(defTable.at(killed).begin(), defTable.at(killed).end());
 
       if (mustPointTo.contains(killed)) {
-        std::set<Instruction *> mustLoad = mustPointTo.at(killed);
         for (auto loadInst : mustPointTo.at(killed)) {
           for (auto stored : mustPointTo.at(loadInst)) {
             if (stored != killed) {
