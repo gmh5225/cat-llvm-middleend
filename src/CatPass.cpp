@@ -284,24 +284,17 @@ namespace {
                 break;
             }
           } else {
-            // If I is not a CAT instruction, see if it is a call that variables escape to
-            // If call is not a NoModRef, then kill the escaped variable
             if (calls.contains(&I)) {
-              for (auto var : escaped) {
-                if (CallInst *varCall = dyn_cast<CallInst>(var)) {
-                  switch (aliasAnalysis.getModRefInfo(&I, varCall)) {
-                    case ModRefInfo::ModRef:
-                    case ModRefInfo::Mod:
-                    case ModRefInfo::Ref:
-                    case ModRefInfo::MustRef:
-                    case ModRefInfo::MustMod:
-                    case ModRefInfo::MustModRef:
+              if (CallInst *escapeCall = dyn_cast<CallInst>(&I)) {
+                switch (aliasAnalysis.getModRefBehavior(escapeCall->getCalledFunction())) {
+                  case FMRB_DoesNotAccessMemory:
+                    break;
+                  default:
+                    for (auto escapeVariable : escaped) {
                       gen[&I].insert(&I);
-                      killHelper(&I, var, kill, mustPointTo, defTable);
-                      break;
-                    default:
-                      break;
-                  }
+                      killHelper(&I, escapeVariable, kill, mustPointTo, defTable);
+                    }
+                    break;
                 }
               }
             }
