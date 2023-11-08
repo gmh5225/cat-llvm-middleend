@@ -163,75 +163,13 @@ namespace {
       }
     }
 
-    // This function creates the mayPointTo and mustPointTo sets for alias analysis
-    void createAliasSets(Function &F,
-                         AliasAnalysis &aliasAnalysis,
-                         std::map<Instruction *, std::set<Instruction *>> &mayPointTo,
-                         std::map<Instruction *, std::set<Instruction *>> &mustPointTo) {
-      std::vector<StoreInst *> stores;
-      std::vector<Instruction *> loads;
-
-      for (auto &I : instructions(F)) {
-        if (StoreInst *store = dyn_cast<StoreInst>(&I)) {
-          stores.push_back(store);
-        } else if (isa<LoadInst>(&I)) {
-          loads.push_back(&I);
-        }
-      }
-
-      for (auto store : stores) {
-        for (auto load : loads) {
-          if (CallInst *stored = dyn_cast<CallInst>(store->getValueOperand())) {
-            switch (aliasAnalysis.alias(MemoryLocation::get(store), MemoryLocation::get(load))) {
-              case AliasResult::MayAlias:
-              case AliasResult::PartialAlias:
-                mayPointTo[stored].insert(load);
-                mayPointTo[load].insert(stored);
-                break;
-              case AliasResult::MustAlias:
-                mustPointTo[stored].insert(load);
-                mustPointTo[load].insert(stored);
-                break;
-              default:
-                break;
-            }
-          }
-        }
-      }
-
-      for (auto [may, pointTo] : mayPointTo) {
-        errs() << "=============MAY=============" << *may << "\n";
-        for (auto point : pointTo) {
-          errs() << *point << "\n";
-        }
-        errs() << "\n";
-      }
-      for (auto [must, pointTo] : mustPointTo) {
-        errs() << "==============MUST============" << *must << "\n";
-        for (auto point : pointTo) {
-          errs() << *point << "\n";
-        }
-        errs() << "\n";
-      }
-    }
-
     // Helper function for killing instructions
     void killHelper(Instruction *killer,
                     Instruction *killed,
                     std::map<Instruction *, std::set<Instruction *>> &kill,
-                    std::map<Instruction *, std::set<Instruction *>> mustPointTo,
                     std::map<Instruction *, std::set<Instruction *>> defTable) {
       kill[killer].insert(defTable.at(killed).begin(), defTable.at(killed).end());
-
-      if (mustPointTo.contains(killed)) {
-        for (auto loadInst : mustPointTo.at(killed)) {
-          for (auto stored : mustPointTo.at(loadInst)) {
-            if (stored != killed) {
-              kill[killer].insert(stored);
-            }
-          }
-        }
-      }
+      kill[killer].erase(killer);
     }
 
     // Helper function for computing gen and kill sets
@@ -241,9 +179,7 @@ namespace {
                         std::map<Instruction *, std::set<Instruction *>> &kill,
                         std::map<Instruction *, std::set<Instruction *>> defTable) {
       std::set<Instruction *> escaped, calls;
-      std::map<Instruction *, std::set<Instruction *>> mayPointTo, mustPointTo;
       getEscapedInsts(defTable, escaped, calls);
-      createAliasSets(F, aliasAnalysis, mayPointTo, mustPointTo);
 
       for (auto &I : instructions(F)) {
         if (CallInst *call = dyn_cast<CallInst>(&I)) {
@@ -252,8 +188,7 @@ namespace {
             switch (CATMap.at(callee)) {
               case CAT_new:
                 gen[&I].insert(&I);
-                killHelper(&I, &I, kill, mustPointTo, defTable);
-                kill[&I].erase(&I);
+                killHelper(&I, &I, kill, defTable);
                 break;
               case CAT_add:
               case CAT_sub:
@@ -261,19 +196,18 @@ namespace {
                 if (Instruction *arg = dyn_cast<Instruction>(call->getArgOperand(0))) {
                   if (defTable.contains(arg)) {                 
                     gen[&I].insert(&I);
-                    killHelper(&I, arg, kill, mustPointTo, defTable);
-                    kill[&I].erase(&I);
+                    killHelper(&I, arg, kill, defTable);
 
                     // Select: kill true and false values
                     if (SelectInst *sel = dyn_cast<SelectInst>(arg)) {
                       if (Instruction *trueVal = dyn_cast<Instruction>(sel->getTrueValue())) {
                         if (defTable.contains(trueVal)) {
-                          killHelper(&I, trueVal, kill, mustPointTo, defTable);
+                          killHelper(&I, trueVal, kill, defTable);
                         }
                       }
                       if (Instruction *falseVal = dyn_cast<Instruction>(sel->getFalseValue())) {
                         if (defTable.contains(falseVal)) {
-                          killHelper(&I, falseVal, kill, mustPointTo, defTable);
+                          killHelper(&I, falseVal, kill, defTable);
                         }
                       }
                     }
@@ -290,9 +224,9 @@ namespace {
                   case FMRB_DoesNotAccessMemory:
                     break;
                   default:
-                    for (auto escapeVariable : escaped) {
+                    for (auto escapeVar : escaped) {
                       gen[&I].insert(&I);
-                      killHelper(&I, escapeVariable, kill, mustPointTo, defTable);
+                      killHelper(&I, escapeVar, kill, defTable);
                     }
                     break;
                 }
@@ -303,18 +237,9 @@ namespace {
           // If PHI nodes or selects have been redefined, then kill those redefinitions
           for (auto def : defTable) {
             if (def.first == &I) {
-              killHelper(&I, def.first, kill, mustPointTo, defTable);
+              killHelper(&I, def.first, kill, defTable);
               break;
             }
-          }
-        } else if (isa<LoadInst>(&I)) {
-          // If I is a load, then add both must point to and may point to of
-          // the corresponding stored value
-          if (mayPointTo.contains(&I)) {
-            gen[&I].insert(mayPointTo.at(&I).begin(), mayPointTo.at(&I).end());
-          }
-          if (mustPointTo.contains(&I)) {
-            gen[&I].insert(mustPointTo.at(&I).begin(), mustPointTo.at(&I).end());
           }
         }
       }
@@ -416,6 +341,172 @@ namespace {
       computeInOut(F, inSets, outSets, gen, kill);      
     }
 
+    // This function computes memory instructions that may point to each other 
+    // using LLVM alias analysis
+    void computeMayPointTo(Function &F,
+                           AliasAnalysis &aliasAnalysis,
+                           std::map<Instruction *, std::set<Instruction *>> &mayPointTo) {
+      std::vector<StoreInst *> stores;
+      std::vector<Instruction *> loads;
+
+      for (auto &I : instructions(F)) {
+        if (StoreInst *store = dyn_cast<StoreInst>(&I)) {
+          stores.push_back(store);
+        } else if (isa<LoadInst>(&I)) {
+          loads.push_back(&I);
+        }
+      }
+
+      for (auto storeInst : stores) {
+        for (auto loadInst : loads) {
+          switch (aliasAnalysis.alias(MemoryLocation::get(storeInst), MemoryLocation::get(loadInst))) {
+            case AliasResult::MayAlias:
+            case AliasResult::PartialAlias:
+            case AliasResult::MustAlias:
+              mayPointTo[storeInst].insert(loadInst);
+              mayPointTo[loadInst].insert(storeInst);
+              break;
+            default:
+              break;
+          }
+        }
+      }
+    }
+
+    // This function creates the aliasIn and aliasOut sets for alias analysis
+    void createAliasSets(Function &F,
+                         AliasAnalysis &aliasAnalysis,
+                         std::map<Instruction *, std::set<std::vector<Instruction *>>> &aliasIn,
+                         std::map<Instruction *, std::set<std::vector<Instruction *>>> &aliasOut) {
+      std::map<Instruction *, std::set<Instruction *>> mayPointTo, pointerToValues;
+      std::map<Instruction *, std::set<std::vector<Instruction *>>> aliasGen, aliasKill;
+
+      computeMayPointTo(F, aliasAnalysis, mayPointTo);
+
+      // Compute the alias gen sets
+      for (auto &I : instructions(F)) {
+        // If I is a store, then for each load it may alias, insert a
+        // {load, CAT call} into the gen set
+        if (StoreInst *store = dyn_cast<StoreInst>(&I)) {
+          if (!isa<SelectInst>(store->getPointerOperand()) && mayPointTo.contains(store)) {
+            if (CallInst *valOp = dyn_cast<CallInst>(store->getValueOperand())) {
+              for (auto pointer : mayPointTo.at(store)) {
+                aliasGen[&I].insert({pointer, valOp});
+                pointerToValues[pointer].insert(valOp);
+              }
+            }
+          }
+        // If I is a CAT instruction that modifies a load, then go through
+        // every other load that it may point to and insert {other load, I}
+        // into the set
+        } else if (CallInst *call = dyn_cast<CallInst>(&I)) {
+          Function *callee = call->getCalledFunction();
+          if (CATMap.contains(callee)) {
+            switch (CATMap.at(callee)) {
+              case CAT_add:
+              case CAT_sub:
+              case CAT_set:
+                if (LoadInst *arg = dyn_cast<LoadInst>(call->getArgOperand(0))) {
+                  if (mayPointTo.contains(arg)) {
+                    for (auto store : mayPointTo.at(arg)) {
+                      for (auto pointer : mayPointTo.at(store)) {
+                        aliasGen[&I].insert({pointer, &I});
+                        pointerToValues[pointer].insert(&I);
+                      }
+                    }
+                  }
+                }
+                break;
+              default:
+                break;
+            }
+          }
+        }
+      }
+
+      // Compute the alias kill sets
+      // Kill every pair with the form {pointer, value != stored value}
+      for (auto &I : instructions(F)) {
+        if (StoreInst *store = dyn_cast<StoreInst>(&I)) {
+          if (mayPointTo.contains(store)) {
+            if (CallInst *valOp = dyn_cast<CallInst>(store->getValueOperand())) {
+              for (auto pointer : mayPointTo.at(store)) {
+                for (auto val : pointerToValues.at(pointer)) {
+                  if (val != valOp) {
+                    aliasKill[&I].insert({pointer, val});
+                  }
+                }
+              }
+            }
+          }
+        } else if (CallInst *call = dyn_cast<CallInst>(&I)) {
+          Function *callee = call->getCalledFunction();
+          if (CATMap.contains(callee)) {
+            switch (CATMap.at(callee)) {
+              case CAT_add:
+              case CAT_sub:
+              case CAT_set:
+                if (LoadInst *arg = dyn_cast<LoadInst>(call->getArgOperand(0))) {
+                  if (mayPointTo.contains(arg)) {
+                    for (auto store : mayPointTo.at(arg)) {
+                      for (auto pointer : mayPointTo.at(store)) {
+                        for (auto val : pointerToValues.at(pointer)) {
+                          if (val != &I) {
+                            aliasKill[&I].insert({pointer, val});
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+                break;
+              default:
+                break;
+            }
+          }
+        } else if (SelectInst *select = dyn_cast<SelectInst>(&I)) {
+          for (auto pointer : pointerToValues) {
+            if (LoadInst *loadPtr = dyn_cast<LoadInst>(pointer.first)) {
+              if (loadPtr->getPointerOperand() == select->getTrueValue() ||
+                  loadPtr->getPointerOperand() == select->getFalseValue()) {
+                for (auto val : pointer.second) {
+                  aliasKill[&I].insert({pointer.first, val});
+                }
+              }
+            }
+          }
+        }
+      }
+
+      // Generate in/out sets
+      bool done;
+      do {
+        done = true;
+
+        for (auto &I : instructions(F)) {
+          Instruction *prev = I.getPrevNode();
+          if (!prev) {
+            for (auto pred : predecessors(I.getParent())) {
+              aliasIn[&I].insert(aliasOut[pred->getTerminator()].begin(), aliasOut[pred->getTerminator()].end());
+            }
+          } else {
+            aliasIn[&I].insert(aliasOut[prev].begin(), aliasOut[prev].end());
+          }
+
+          std::set<std::vector<Instruction *>> newOut;
+          newOut.insert(aliasGen[&I].begin(), aliasGen[&I].end());
+          for (auto vec : aliasIn[&I]) {
+            if (!aliasKill[&I].contains(vec)) {
+              newOut.insert(vec);
+            }
+          }
+
+          done = done & (newOut == aliasOut[&I]);
+          aliasOut[&I] = newOut;
+        }
+      } while (!done);
+    }    
+
     // This function runs DFS to check if there is a cycle when 
     // traversing the incoming values in a PHI node
     bool containsCycle(Value *v) {
@@ -464,18 +555,18 @@ namespace {
     // This function checks if a value valToCheck is a constant
     // and returns a pointer to the ConstantInt if it is a constant
     // Otherwise, it returns a nullptr
-    ConstantInt *isConstant(std::set<Instruction *> inSet, 
-                            Value *valToCheck) {
+    ConstantInt *isConstant(Value *valToCheck,
+                            std::set<Instruction *> inSet,
+                            std::set<std::vector<Instruction *>> mayPointTo) {
       // If the value is an argument, it is not safe to assume it is a constant
       if (isa<Argument>(valToCheck)) {
         return nullptr;
       }
 
       ConstantInt *constPtr = nullptr;
+      ConstantInt *nonCatConst = nullptr;
       int64_t constant;
       bool initialized = false;
-      ConstantInt *phiConst = nullptr;
-      bool escaped = isEscaped(valToCheck);
 
       // If valToCheck is a PHI node, check if all incoming values 
       // are constants and if they are the same constant
@@ -492,20 +583,36 @@ namespace {
             continue;
           }
 
-          if (ConstantInt *constInt = isConstant(inSet, phiVal)) {
+          if (ConstantInt *constInt = isConstant(phiVal, inSet, mayPointTo)) {
             if (!initialized) {
-              phiConst = constInt;
+              nonCatConst = constInt;
               constant = constInt->getSExtValue();
               initialized = true;
             } else if (constant != constInt->getSExtValue()) {
-              phiConst = nullptr;
-              initialized = false;
+              nonCatConst = nullptr;
               break;
             }
           } else {
-            phiConst = nullptr;
-            initialized = false;
+            nonCatConst = nullptr;
             break;
+          }
+        }
+      } else if (LoadInst *load = dyn_cast<LoadInst>(valToCheck)) {
+        for (auto aliasPair : mayPointTo) {
+          if (load == aliasPair[0]) {
+            if (ConstantInt *constInt = isConstant(aliasPair[1], inSet, mayPointTo)) {
+              if (!initialized) {
+                nonCatConst = constInt;
+                constant = constInt->getSExtValue();
+                initialized = true;
+              } else {
+                nonCatConst = nullptr;
+                break;
+              }
+            } else {
+              nonCatConst = nullptr;
+              break;
+            }
           }
         }
       }
@@ -555,19 +662,20 @@ namespace {
               default:
                 break;
             }
-          } else if (escaped) {
+          } else if (isEscaped(valToCheck)) {
             return nullptr;
           }
         }
       }
       
       // Operations performed on the PHI take precedence over incoming values
-      return constPtr ? constPtr : phiConst;
+      return constPtr ? constPtr : nonCatConst;
     }
 
     // This function runs constant propagation on a set of CAT instruction
     bool runConstantPropagation(std::map<Instruction *, std::set<Instruction *>> inSets,
-                                std::set<Instruction *> &CATInstructions) {
+                                std::set<Instruction *> &CATInstructions,
+                                std::map<Instruction *, std::set<std::vector<Instruction *>>> aliasIn) {
       bool modified = false;
       std::map<Instruction *, ConstantInt *> toReplace;
 
@@ -575,7 +683,7 @@ namespace {
         if (CallInst *call = dyn_cast<CallInst>(I)) {
           Function *callee = call->getCalledFunction();
           if (currentModule->getFunction("CAT_get") == callee) {
-            if (ConstantInt *c = isConstant(inSets[I], call->getArgOperand(0))) {
+            if (ConstantInt *c = isConstant(call->getArgOperand(0), inSets[I], aliasIn[I])) {
               toReplace[I] = c;
               modified = true;
             }
@@ -594,7 +702,8 @@ namespace {
 
     // This function runs constant folding on a set of CAT instructions
     bool runConstantFolding(std::map<Instruction *, std::set<Instruction *>> inSets,
-                            std::set<Instruction *> &CATInstructions) {
+                            std::set<Instruction *> &CATInstructions,
+                            std::map<Instruction *, std::set<std::vector<Instruction *>>> aliasIn) {
       bool modified = false;
       std::vector<Instruction *> toDelete;
 
@@ -604,8 +713,8 @@ namespace {
           
           Function *callee = call->getCalledFunction();
           if (currentModule->getFunction("CAT_add") == callee) {
-            ConstantInt *const1 = isConstant(inSets[I], call->getArgOperand(1));
-            ConstantInt *const2 = isConstant(inSets[I], call->getArgOperand(2));
+            ConstantInt *const1 = isConstant(call->getArgOperand(1), inSets[I], aliasIn[I]);
+            ConstantInt *const2 = isConstant(call->getArgOperand(2), inSets[I], aliasIn[I]);
 
             if (const1 && const2) {
               IntegerType *intType = IntegerType::get(currentModule->getContext(), 64);
@@ -618,8 +727,8 @@ namespace {
               modified = true;
             }
           } else if (currentModule->getFunction("CAT_sub") == callee) {
-            ConstantInt *const1 = isConstant(inSets[I], call->getArgOperand(1));
-            ConstantInt *const2 = isConstant(inSets[I], call->getArgOperand(2));
+            ConstantInt *const1 = isConstant(call->getArgOperand(1), inSets[I], aliasIn[I]);
+            ConstantInt *const2 = isConstant(call->getArgOperand(2), inSets[I], aliasIn[I]);
 
             if (const1 && const2) {
               IntegerType *intType = IntegerType::get(currentModule->getContext(), 64);
@@ -645,7 +754,8 @@ namespace {
 
     // This function runs algebraic simplification on a set of CAT instructions
     bool runAlgebraicSimplification(std::map<Instruction *, std::set<Instruction *>> inSets,
-                                    std::set<Instruction *> &CATInstructions) {
+                                    std::set<Instruction *> &CATInstructions,
+                                    std::map<Instruction *, std::set<std::vector<Instruction *>>> aliasIn) {
       bool modified = false;
       std::vector<Instruction *> toDelete;
 
@@ -655,7 +765,7 @@ namespace {
 
           Function *callee = call->getCalledFunction();
           if (currentModule->getFunction("CAT_add") == callee) {
-            if (ConstantInt *c = isConstant(inSets[I], call->getArgOperand(1))) {
+            if (ConstantInt *c = isConstant(call->getArgOperand(1), inSets[I], aliasIn[I])) {
               // If the 2nd argument is a constant = 0, then simplify to 3rd argument
               if (c->getSExtValue() == 0) {
                 Instruction *catGet = builder.CreateCall(currentModule->getFunction("CAT_get"), {call->getArgOperand(2)});
@@ -666,7 +776,7 @@ namespace {
                 toDelete.push_back(I);
                 modified = true;
               }
-            } else if (ConstantInt *c = isConstant(inSets[I], call->getArgOperand(2))) {
+            } else if (ConstantInt *c = isConstant(call->getArgOperand(2), inSets[I], aliasIn[I])) {
               // If the 3rd argument is a constant = 0, then simplify to 2nd argument
               if (c->getSExtValue() == 0) {
                 Instruction *catGet = builder.CreateCall(currentModule->getFunction("CAT_get"), {call->getArgOperand(1)});
@@ -679,7 +789,7 @@ namespace {
               }
             }
           } else if (currentModule->getFunction("CAT_sub") == callee) {
-            if (ConstantInt *c = isConstant(inSets[I], call->getArgOperand(2))) {
+            if (ConstantInt *c = isConstant(call->getArgOperand(2), inSets[I], aliasIn[I])) {
               // If the 3rd argument is a constant = 0, then simplify to 2nd argument
               if (c->getSExtValue() == 0) {
                 Instruction *catGet = builder.CreateCall(currentModule->getFunction("CAT_get"), {call->getArgOperand(1)});
@@ -715,14 +825,19 @@ namespace {
     // constant optimizations every time the function is modified
     void regenerateDataStructs(Function &F,
                                AliasAnalysis &aliasAnalysis,
+                               std::map<Instruction *, std::set<Instruction *>> &defTable,
                                std::map<Instruction *, std::set<Instruction *>> &inSets,
                                std::map<Instruction *, std::set<Instruction *>> &outSets,
-                               std::map<Instruction *, std::set<Instruction *>> &defTable) {
+                               std::map<Instruction *, std::set<std::vector<Instruction *>>> &aliasIn,
+                               std::map<Instruction *, std::set<std::vector<Instruction *>>> &aliasOut) {
+      defTable.clear();
       inSets.clear();
       outSets.clear();
-      defTable.clear();
+      aliasIn.clear();
+      aliasOut.clear();
       createDefTable(F, defTable);
       createReachingDefs(F, aliasAnalysis, inSets, outSets, defTable);
+      createAliasSets(F, aliasAnalysis, aliasIn, aliasOut);
     }
 
     // This function is invoked once per function compiled
@@ -731,28 +846,30 @@ namespace {
       bool modified = false;
       std::set<Instruction *> CATInstructions;
       std::map<Instruction *, std::set<Instruction *>> inSets, outSets, defTable;
+      std::map<Instruction *, std::set<std::vector<Instruction *>>> aliasIn, aliasOut;
 
       AliasAnalysis &aliasAnalysis = getAnalysis<AAResultsWrapperPass>().getAAResults();
       getCatInstructions(F, CATInstructions);
-      regenerateDataStructs(F, aliasAnalysis, inSets, outSets, defTable);
+      regenerateDataStructs(F, aliasAnalysis, defTable, inSets, outSets, aliasIn, aliasOut);
 
-      printDefTable(F, defTable);
-      printReachingDefs(F, inSets, outSets);
+      // printDefTable(F, defTable);
+      // printReachingDefs(F, inSets, outSets);
+      // printAliasSets(F, aliasIn, aliasOut);
 
       // Constant propagation
-      modified |= runConstantPropagation(inSets, CATInstructions);
+      modified |= runConstantPropagation(inSets, CATInstructions, aliasIn);
 
       // Constant folding
       if (modified) {
-        regenerateDataStructs(F, aliasAnalysis, inSets, outSets, defTable);
+        regenerateDataStructs(F, aliasAnalysis, defTable, inSets, outSets, aliasIn, aliasOut);
       }
-      modified |= runConstantFolding(inSets, CATInstructions);
+      modified |= runConstantFolding(inSets, CATInstructions, aliasIn);
 
       // Algebraic Simplification
       if (modified) {
-        regenerateDataStructs(F, aliasAnalysis, inSets, outSets, defTable);
+        regenerateDataStructs(F, aliasAnalysis, defTable, inSets, outSets, aliasIn, aliasOut);
       }
-      modified |= runAlgebraicSimplification(inSets, CATInstructions);
+      modified |= runAlgebraicSimplification(inSets, CATInstructions, aliasIn);
 
       return modified;
     }
@@ -786,6 +903,23 @@ namespace {
         errs() << "}\nOUT\n{\n";
         for (auto out : outSets[&I]) {
           errs() << *out << "\n";
+        }
+        errs() << "}\n";
+      }
+    }
+
+    void printAliasSets(Function &F,
+                        std::map<Instruction *, std::set<std::vector<Instruction *>>> aliasIn, 
+                        std::map<Instruction *, std::set<std::vector<Instruction *>>> aliasOut) {
+      errs() << "Function \"" << F.getName() << "\"\n";
+      for (auto &I : instructions(F)) {
+        errs() << "INSTRUCTION:" << I << "\nIN\n{\n";
+        for (auto in : aliasIn[&I]) {
+          errs() << *(in[0]) << *(in[1]) << "\n";
+        }
+        errs() << "}\nOUT\n{\n";
+        for (auto out : aliasOut[&I]) {
+          errs() << *(out[0]) << *(out[1]) << "\n";
         }
         errs() << "}\n";
       }
