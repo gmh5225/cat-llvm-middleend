@@ -12,22 +12,16 @@
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/Transforms/IPO/PassManagerBuilder.h"
 #include "llvm/Transforms/Utils/BasicBlockUtils.h"
+#include "llvm/Transforms/Utils/Cloning.h"
 #include <map>
 #include <set>
 #include <vector>
 
-enum CAT_API {
-  CAT_new,
-  CAT_add,
-  CAT_sub,
-  CAT_get,
-  CAT_set,
-  CAT_destroy
-};
-
 using namespace llvm;
 
 namespace {
+  enum CAT_API {CAT_new, CAT_add, CAT_sub, CAT_get, CAT_set, CAT_destroy};
+
   struct CAT : public FunctionPass {
     static char ID; 
     Module* currentModule;
@@ -50,7 +44,7 @@ namespace {
 
     // This function finds all CAT instructions in a function F and stores them into
     // the set CATInstructions
-    void getCatInstructions(Function &F, std::set<Instruction *> &CATInstructions) {
+    void getCATInstructions(Function &F, std::set<Instruction *> &CATInstructions) {
       for (auto &I : instructions(F)) {
         if (CallInst *call = dyn_cast<CallInst>(&I)) {
           Function *callee = call->getCalledFunction();
@@ -63,29 +57,22 @@ namespace {
     
     // This function creates a definition table of CAT variables
     void createDefTable(Function &F,
-                        std::map<Instruction *, std::set<Instruction *>> &defTable) {
+                        std::map<Value *, std::set<Instruction *>> &defTable) {
       for (auto &I : instructions(F)) {
         if (CallInst *call = dyn_cast<CallInst>(&I)) {
-          if (currentModule->getFunction("CAT_new") == call->getCalledFunction()) {
-            defTable[&I].insert(&I);
-          }
-        }
-
-        for (auto user : I.users()) {
-          if (CallInst *userCall = dyn_cast<CallInst>(user)) {
-            Function *userCallee = userCall->getCalledFunction();
-            if (CATMap.contains(userCallee)) {
-              switch (CATMap.at(userCallee)) {
-                case CAT_add:
-                case CAT_sub:
-                case CAT_set:
-                  if (userCall->getArgOperand(0) == &I) {
-                    defTable[&I].insert(userCall);
-                  }
-                  break;
-                default:
-                  break;
-              }
+          Function *callee = call->getCalledFunction();
+          if (CATMap.contains(callee)) {
+            switch (CATMap.at(callee)) {
+              case CAT_new:
+                defTable[&I].insert(&I);
+                break;
+              case CAT_add:
+              case CAT_sub:
+              case CAT_set:
+                defTable[call->getArgOperand(0)].insert(&I);
+                break;
+              default:
+                break;
             }
           }
         }
@@ -140,8 +127,8 @@ namespace {
     }
 
     // This function finds every variable that escapes
-    void getEscapedInsts(std::map<Instruction *, std::set<Instruction *>> defTable,
-                         std::set<Instruction *> &escaped,
+    void getEscapedInsts(std::map<Value *, std::set<Instruction *>> defTable,
+                         std::set<Value *> &escaped,
                          std::set<Instruction *> &calls) {
       for (auto def : defTable) {
         for (auto user : def.first->users()) {
@@ -165,9 +152,9 @@ namespace {
 
     // Helper function for killing instructions
     void killHelper(Instruction *killer,
-                    Instruction *killed,
+                    Value *killed,
                     std::map<Instruction *, std::set<Instruction *>> &kill,
-                    std::map<Instruction *, std::set<Instruction *>> defTable) {
+                    std::map<Value *, std::set<Instruction *>> defTable) {
       kill[killer].insert(defTable.at(killed).begin(), defTable.at(killed).end());
       kill[killer].erase(killer);
     }
@@ -177,8 +164,9 @@ namespace {
                         AliasAnalysis &aliasAnalysis,
                         std::map<Instruction *, std::set<Instruction *>> &gen,
                         std::map<Instruction *, std::set<Instruction *>> &kill,
-                        std::map<Instruction *, std::set<Instruction *>> defTable) {
-      std::set<Instruction *> escaped, calls;
+                        std::map<Value *, std::set<Instruction *>> defTable) {
+      std::set<Value *> escaped;
+      std::set<Instruction *> calls;
       getEscapedInsts(defTable, escaped, calls);
 
       for (auto &I : instructions(F)) {
@@ -193,7 +181,7 @@ namespace {
               case CAT_add:
               case CAT_sub:
               case CAT_set:
-                if (Instruction *arg = dyn_cast<Instruction>(call->getArgOperand(0))) {
+                if (Value *arg = dyn_cast<Value>(call->getArgOperand(0))) {
                   if (defTable.contains(arg)) {                 
                     gen[&I].insert(&I);
                     killHelper(&I, arg, kill, defTable);
@@ -332,7 +320,7 @@ namespace {
                             AliasAnalysis &aliasAnalysis,
                             std::map<Instruction *, std::set<Instruction *>> &inSets, 
                             std::map<Instruction *, std::set<Instruction *>> &outSets,
-                            std::map<Instruction *, std::set<Instruction *>> defTable) {
+                            std::map<Value *, std::set<Instruction *>> defTable) {
       // Compute gen and kill sets
       std::map<Instruction *, std::set<Instruction *>> gen, kill;
       computeGenKill(F, aliasAnalysis, gen, kill, defTable);
@@ -564,9 +552,30 @@ namespace {
       }
 
       ConstantInt *constPtr = nullptr;
-      ConstantInt *nonCatConst = nullptr;
+      ConstantInt *phiConst = nullptr;
       int64_t constant;
       bool initialized = false;
+
+      // If valToCheck is a load, then run alias analysis
+      if (LoadInst *load = dyn_cast<LoadInst>(valToCheck)) {
+        for (auto aliasPair : mayPointTo) {
+          if (load == aliasPair[0]) {
+            if (ConstantInt *constInt = isConstant(aliasPair[1], inSet, mayPointTo)) {
+              if (!initialized) {
+                constPtr = constInt;
+                constant = constInt->getSExtValue();
+                initialized = true;
+              } else if (constant != constInt->getSExtValue()) {
+                return nullptr;
+              }
+            } else {
+              return nullptr;
+            }
+          }
+        }
+
+        return constPtr;
+      }
 
       // If valToCheck is a PHI node, check if all incoming values 
       // are constants and if they are the same constant
@@ -585,34 +594,16 @@ namespace {
 
           if (ConstantInt *constInt = isConstant(phiVal, inSet, mayPointTo)) {
             if (!initialized) {
-              nonCatConst = constInt;
+              phiConst = constInt;
               constant = constInt->getSExtValue();
               initialized = true;
             } else if (constant != constInt->getSExtValue()) {
-              nonCatConst = nullptr;
+              phiConst = nullptr;
               break;
             }
           } else {
-            nonCatConst = nullptr;
+            phiConst = nullptr;
             break;
-          }
-        }
-      } else if (LoadInst *load = dyn_cast<LoadInst>(valToCheck)) {
-        for (auto aliasPair : mayPointTo) {
-          if (load == aliasPair[0]) {
-            if (ConstantInt *constInt = isConstant(aliasPair[1], inSet, mayPointTo)) {
-              if (!initialized) {
-                nonCatConst = constInt;
-                constant = constInt->getSExtValue();
-                initialized = true;
-              } else {
-                nonCatConst = nullptr;
-                break;
-              }
-            } else {
-              nonCatConst = nullptr;
-              break;
-            }
           }
         }
       }
@@ -669,7 +660,7 @@ namespace {
       }
       
       // Operations performed on the PHI take precedence over incoming values
-      return constPtr ? constPtr : nonCatConst;
+      return constPtr ? constPtr : phiConst;
     }
 
     // This function runs constant propagation on a set of CAT instruction
@@ -825,7 +816,7 @@ namespace {
     // constant optimizations every time the function is modified
     void regenerateDataStructs(Function &F,
                                AliasAnalysis &aliasAnalysis,
-                               std::map<Instruction *, std::set<Instruction *>> &defTable,
+                               std::map<Value *, std::set<Instruction *>> &defTable,
                                std::map<Instruction *, std::set<Instruction *>> &inSets,
                                std::map<Instruction *, std::set<Instruction *>> &outSets,
                                std::map<Instruction *, std::set<std::vector<Instruction *>>> &aliasIn,
@@ -844,16 +835,17 @@ namespace {
     // The LLVM IR of the input functions is ready and it can be analyzed and/or transformed
     bool runOnFunction (Function &F) override {
       bool modified = false;
-      std::set<Instruction *> CATInstructions;
-      std::map<Instruction *, std::set<Instruction *>> inSets, outSets, defTable;
+      std::set<Instruction *> CATInstructions, nonCATCalls;
+      std::map<Instruction *, std::set<Instruction *>> inSets, outSets;
+      std::map<Value *, std::set<Instruction *>> defTable;
       std::map<Instruction *, std::set<std::vector<Instruction *>>> aliasIn, aliasOut;
 
       AliasAnalysis &aliasAnalysis = getAnalysis<AAResultsWrapperPass>().getAAResults();
-      getCatInstructions(F, CATInstructions);
+      getCATInstructions(F, CATInstructions);
       regenerateDataStructs(F, aliasAnalysis, defTable, inSets, outSets, aliasIn, aliasOut);
 
-      // printDefTable(F, defTable);
-      // printReachingDefs(F, inSets, outSets);
+      printDefTable(F, defTable);
+      printReachingDefs(F, inSets, outSets);
       // printAliasSets(F, aliasIn, aliasOut);
 
       // Constant propagation
@@ -882,7 +874,7 @@ namespace {
 
     // This function prints the definitions of a variable for debugging purposes
     void printDefTable(Function &F, 
-                       std::map<Instruction *, std::set<Instruction *>> defTable) {
+                       std::map<Value *, std::set<Instruction *>> defTable) {
       for (auto [def, insts] : defTable) {
         for (auto inst : insts) {
           errs() << F.getName() << *def << *inst << "\n";
