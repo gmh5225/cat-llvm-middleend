@@ -32,7 +32,7 @@ namespace {
     /**
      * This function is invoked once at the initialization phase of the compiler.
      * 
-     * The LLVM IR of functions isn't ready at this point
+     * The LLVM IR of functions isn't ready at this point.
      */
     bool doInitialization(Module &M) override {
       CATMap[M.getFunction("CAT_new")] = CAT_new;
@@ -52,15 +52,14 @@ namespace {
       CallGraph &CG = getAnalysis<CallGraphWrapperPass>().getCallGraph();
 
       modified |= inlineFunctions(M, CG);
-      // errs() << M << "\n";
+
       modified |= optimizeFunctions(M);
 
       return modified;
     }
 
     /**
-     * Wrapper function for inlining functions. Checks if a 
-     * function is a declaration or not before continuing.
+     * Wrapper function for inlining functions. Checks if a function is a declaration or not before continuing.
      */
     bool inlineFunctions(Module &M, CallGraph &CG) {
       bool modified = false;
@@ -105,8 +104,7 @@ namespace {
     }
 
     /**
-     * This function checks if a function calls itself
-     * using the call graph.
+     * This function checks if a function calls itself using the call graph.
      */
     bool isRecursive(Function *F, CallGraph &CG) {
       if (F->empty()) {
@@ -757,7 +755,7 @@ namespace {
     ConstantInt *isConstant(
       Value *valToCheck,
       std::set<Instruction *> inSet,
-      std::set<std::vector<Instruction *>> mptSet
+      std::set<std::vector<Instruction *>> mptIn
     ) {
       // If the value is an argument, it is not safe to assume it is a constant
       if (isa<Argument>(valToCheck)) {
@@ -771,7 +769,7 @@ namespace {
 
       // If valToCheck is a load, then run alias analysis
       if (auto load = dyn_cast<LoadInst>(valToCheck)) {
-        for (auto aliasPair : mptSet) {
+        for (auto aliasPair : mptIn) {
           if (load == aliasPair[0]) {
             if (auto aliasCall = dyn_cast<CallInst>(aliasPair[1])) {
               Function *aliasCallee = aliasCall->getCalledFunction();
@@ -817,7 +815,7 @@ namespace {
             continue;
           }
 
-          if (!setConstPtr(isConstant(phiVal, inSet, mptSet), phiConst, constant, initialized)) {
+          if (!setConstPtr(isConstant(phiVal, inSet, mptIn), phiConst, constant, initialized)) {
             break;
           }
         }
@@ -832,12 +830,12 @@ namespace {
           return nullptr;
         }
 
-        if (ConstantInt* constInt = isConstant(select->getTrueValue(), inSet, mptSet)) {
+        if (ConstantInt* constInt = isConstant(select->getTrueValue(), inSet, mptIn)) {
           constPtr = constInt;
           constant = constInt->getSExtValue();
           initialized = true;
 
-          if (ConstantInt* constInt = isConstant(select->getFalseValue(), inSet, mptSet)) {
+          if (ConstantInt* constInt = isConstant(select->getFalseValue(), inSet, mptIn)) {
             if (constant != constInt->getSExtValue()) {
               return nullptr;
             }
