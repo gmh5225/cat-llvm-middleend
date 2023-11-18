@@ -75,12 +75,20 @@ namespace {
     bool runOnModule(Module &M) override {
       bool modified = false;
       CallGraph &CG = getAnalysis<CallGraphWrapperPass>().getCallGraph();
-
       modified |= inlineFunctions(M, CG);
-
       modified |= optimizeFunctions(M);
-
       return modified;
+    }
+
+    /**
+     * We don't modify the program, so we preserve all analyses.
+     * 
+     * The LLVM IR of functions isn't ready at this point.
+     */
+    void getAnalysisUsage(AnalysisUsage &AU) const override {
+      AU.addRequired<AAResultsWrapperPass>();
+      AU.addRequired<CallGraphWrapperPass>();
+      return;
     }
 
     /**
@@ -923,7 +931,6 @@ namespace {
     /**
      * If a value is a constant then either initialize the constant variables 
      * or check if the value is the same as previously found constants. 
-     * 
      * Return true afterwards.
      * 
      * If it is not a constant or it is different than previously 
@@ -950,7 +957,7 @@ namespace {
     }
 
     /**
-     * This function runs DFS to check if there is a cycle 
+     * This function runs a depth-first search to check if there is a cycle 
      * when traversing phi nodes or select instructions.
      */
     bool containsCycle(Value *v) {
@@ -1098,8 +1105,7 @@ namespace {
     }
 
     /**
-     * This function runs algebraic simplification on a set of 
-     * CAT instructions.
+     * This function runs algebraic simplification on a set of CAT instructions.
      */
     bool runAlgebraicSimplification(
         Module &M,
@@ -1190,19 +1196,7 @@ namespace {
     }
 
     /**
-     * We don't modify the program, so we preserve all analyses.
-     * 
-     * The LLVM IR of functions isn't ready at this point.
-     */
-    void getAnalysisUsage(AnalysisUsage &AU) const override {
-      AU.addRequired<AAResultsWrapperPass>();
-      AU.addRequired<CallGraphWrapperPass>();
-      return;
-    }
-
-    /**
-     * This function prints the definitions of a variable for 
-     * debugging purposes.
+     * This function prints the definitions of a variable for debugging.
      */
     void printDefTable(Function &F, std::map<Instruction *, 
                        std::set<Instruction *>> defTable) {
@@ -1214,8 +1208,7 @@ namespace {
     }
 
     /**
-     * This function prints the reaching definitions of a function F for 
-     * debugging purposes.
+     * This function prints the reaching definitions of a function F for debugging.
      */
     void printReachingDefs(
         Function &F,
@@ -1236,8 +1229,7 @@ namespace {
     }
 
     /**
-     * This function prints the alias analysis of a function F for 
-     * debugging purposes.
+     * This function prints the alias analysis of a function F for debugging.
      */
     void printAliasSets(
         Function &F,
@@ -1258,7 +1250,7 @@ namespace {
     }
 
     /**
-     * This function prints the may point to sets for debugging purposes.
+     * This function prints the may point to sets of a function F for debugging.
      */
     void printMayPointTo(
         Function &F, 
