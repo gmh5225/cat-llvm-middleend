@@ -14,33 +14,34 @@
 #include "llvm/Transforms/IPO/PassManagerBuilder.h"
 #include "llvm/Transforms/Utils/BasicBlockUtils.h"
 #include "llvm/Transforms/Utils/Cloning.h"
+#include "llvm/Analysis/OptimizationRemarkEmitter.h"
+#include "llvm/IR/Dominators.h"
+#include "llvm/Transforms/Utils/LoopPeel.h"
+#include "llvm/Transforms/Utils/LoopUtils.h"
+#include "llvm/Transforms/Utils/UnrollLoop.h"
+#include "llvm/Analysis/AssumptionCache.h"
+#include "llvm/Analysis/ScalarEvolution.h"
+#include "llvm/Analysis/ScalarEvolutionExpressions.h"
+#include "llvm/Analysis/TargetTransformInfo.h"
 #include <map>
 #include <set>
 #include <vector>
 
 using namespace llvm;
+using namespace std;
 
 namespace {
   enum CAT_API {CAT_new, CAT_add, CAT_sub, CAT_get, CAT_set, CAT_destroy};
 
-  /**
-   * Struct representing pointer-value pairs in alias analysis.
-   */
   struct AliasValue {
     Instruction *pointer;
     Instruction *variable;
   };
 
-  /**
-   * Equality operator for AliasValue structs.
-   */
   bool operator==(const AliasValue &lhs, const AliasValue &rhs) {
     return lhs.pointer == rhs.pointer && lhs.variable == rhs.variable;
   }
 
-  /**
-   * Less than operator for AliasValue structs.
-   */
   bool operator<(const AliasValue &lhs, const AliasValue &rhs) {
     return lhs.pointer == rhs.pointer 
       ? lhs.variable < rhs.variable 
@@ -49,8 +50,7 @@ namespace {
 
   struct CAT : public ModulePass {
     static char ID; 
-    std::map<Function *, CAT_API> CATMap;
-
+    
     CAT() : ModulePass(ID) {}
 
     /**
@@ -74,9 +74,14 @@ namespace {
      */
     bool runOnModule(Module &M) override {
       bool modified = false;
+
       CallGraph &CG = getAnalysis<CallGraphWrapperPass>().getCallGraph();
       modified |= inlineFunctions(M, CG);
+
+      modified |= transformLoops(M);
+      
       modified |= optimizeFunctions(M);
+      
       return modified;
     }
 
@@ -88,29 +93,38 @@ namespace {
     void getAnalysisUsage(AnalysisUsage &AU) const override {
       AU.addRequired<AAResultsWrapperPass>();
       AU.addRequired<CallGraphWrapperPass>();
+      AU.addRequired<AssumptionCacheTracker>();
+      AU.addRequired<DominatorTreeWrapperPass>();
+      AU.addRequired<LoopInfoWrapperPass>();
+      AU.addRequired<ScalarEvolutionWrapperPass>();
+      AU.addRequired<TargetTransformInfoWrapperPass>();
       return;
     }
 
+    private:
+    map<Function *, CAT_API> CATMap;
+
     /**
-     * Wrapper function for inlining functions. Checks if a function is 
-     * a declaration or not before continuing.
+     * Wrapper function for performing inter-procedural code analysis.
      */
     bool inlineFunctions(Module &M, CallGraph &CG) {
       bool modified = false;
       
+      // Inline functions
       for (auto &F : M) {
         if (F.empty()) {
           continue;
         }
-        modified |= inlineHelper(M, F, CG);
+        modified |= inlineFunction(M, F, CG);
       }
+
       return modified;
     }
 
     /**
-     * Helper function for inlining functions.
+     * This function inlines callees in function F.
      */
-    bool inlineHelper(Module &M, Function &F, CallGraph &CG) {
+    bool inlineFunction(Module &M, Function &F, CallGraph &CG) {
       bool modified = false;
       bool inlined = false;
 
@@ -131,7 +145,7 @@ namespace {
       }
 
       if (inlined) {
-        inlineHelper(M, F, CG);
+        modified |= inlineFunction(M, F, CG);
       }
 
       return modified;
@@ -158,8 +172,78 @@ namespace {
       return false;
     }
 
+    bool transformLoops(Module &M) {
+      for (auto &F : M) {
+        if (F.empty() || F.getInstructionCount() > 800) {
+          continue;
+        }
+
+        errs() << F.getInstructionCount() << "\n";
+        errs() << F.size() << "\n";
+
+        auto &LI = getAnalysis<LoopInfoWrapperPass>(F).getLoopInfo();
+        auto &DT = getAnalysis<DominatorTreeWrapperPass>(F).getDomTree();
+        auto &SE = getAnalysis<ScalarEvolutionWrapperPass>(F).getSE();
+        auto &AC = getAnalysis<AssumptionCacheTracker>().getAssumptionCache(F);
+        const auto &TTI = getAnalysis<TargetTransformInfoWrapperPass>().getTTI(F);
+
+        OptimizationRemarkEmitter ORE(&F);
+        for (auto i : LI) {
+          auto loop = &*i;
+          if (analyzeLoop(LI, loop, DT, SE, AC, ORE, TTI)) {
+            return true;
+          }
+        }
+      }
+
+      return false;
+    }
+
+    bool analyzeLoop(LoopInfo &LI, Loop *loop, DominatorTree &DT,
+                     ScalarEvolution &SE, AssumptionCache &AC,
+                     OptimizationRemarkEmitter &ORE,
+                     const TargetTransformInfo &TTI) {
+      if (loop->isLoopSimplifyForm() && loop->isLCSSAForm(DT)) {
+        auto peelingCount = 1;
+        auto peeled = peelLoop(loop, peelingCount, &LI, &SE, DT, &AC, true);
+        if (peeled){
+          errs() << "   Peeled\n";
+          return true;
+        }
+
+        // UnrollLoopOptions ULO;
+        // ULO.Count = 4;
+        // ULO.Force = false;
+        // ULO.Runtime = true;
+        // ULO.AllowExpensiveTripCount = true;
+        // ULO.UnrollRemainder = false;
+        // ULO.ForgetAllSCEV = true;
+
+        // auto unrolled = UnrollLoop(loop, ULO, &LI, &SE, &DT, &AC, &TTI, &ORE,
+        //                            true);
+
+        // switch (unrolled) {
+        //   case LoopUnrollResult::FullyUnrolled:
+        //   case LoopUnrollResult::PartiallyUnrolled:
+        //     return true;
+        //   case LoopUnrollResult::Unmodified:
+        //     break;
+        // }
+      }
+
+      auto subloops = loop->getSubLoops();
+      for (auto j : subloops) {
+        auto subloop = &*j;
+        if (analyzeLoop(LI, subloop, DT, SE, AC, ORE, TTI)) {
+          return true;
+        }
+      }
+      
+      return false;
+    }
+
     /**
-     * Wrapper function for performing optimizations.
+     * Wrapper function for performing constant optimizations.
      */
     bool optimizeFunctions(Module &M) {
       bool modified = false;
@@ -167,7 +251,7 @@ namespace {
         if (F.empty()) {
           continue;
         }
-        modified |= runOnFunction(M, F);
+        modified |= optimizeFunction(M, F);
       }
       return modified;
     }
@@ -178,20 +262,20 @@ namespace {
      * The LLVM IR of the input functions is ready and it can be analyzed 
      * and/or transformed.
      */
-    bool runOnFunction(Module &M, Function &F) {
+    bool optimizeFunction(Module &M, Function &F) {
       bool modified = false;
 
-      std::set<Instruction *> CATInstructions;
-      std::set<Instruction *> nonCATInsts;
+      set<Instruction *> CATInstructions;
+      set<Instruction *> nonCATInsts;
       getCallInstructions(F, CATInstructions, nonCATInsts);
 
-      std::map<Instruction *, std::set<Instruction *>> inSets;
-      std::map<Instruction *, std::set<Instruction *>> outSets;
-      std::map<Instruction *, std::set<Instruction *>> defTable;
-      std::map<Instruction *, std::set<Instruction *>> mayPointTo;
-      std::map<Instruction *, std::set<AliasValue>> aliasIn;
-      std::map<Instruction *, std::set<AliasValue>> aliasOut;
       AliasAnalysis &AA = getAnalysis<AAResultsWrapperPass>(F).getAAResults();
+      map<Instruction *, set<Instruction *>> inSets;
+      map<Instruction *, set<Instruction *>> outSets;
+      map<Instruction *, set<Instruction *>> defTable;
+      map<Instruction *, set<Instruction *>> mayPointTo;
+      map<Instruction *, set<AliasValue>> aliasIn;
+      map<Instruction *, set<AliasValue>> aliasOut;
 
       // Clear and regenerate data structures
       auto populateStructs = [&]() {
@@ -203,8 +287,8 @@ namespace {
         aliasOut.clear();
         createDefTable(F, defTable);
         createMayPointTo(F, AA, mayPointTo);
-        createReachingDefs(F, AA, inSets, outSets, defTable, 
-                           mayPointTo, nonCATInsts);
+        createReachingDefs(F, AA, inSets, outSets, defTable, mayPointTo, 
+                           nonCATInsts);
         createAliasSets(F, AA, aliasIn, aliasOut, mayPointTo, nonCATInsts);
       };
 
@@ -234,8 +318,8 @@ namespace {
       if (modified) {
         populateStructs();
       }
-      modified |= runAlgebraicSimplification(M, CATInstructions, 
-                                             inSets, aliasIn);
+      modified |= runAlgebraicSimplification(M, CATInstructions, inSets, 
+                                             aliasIn);
 
       return modified;
     }
@@ -244,8 +328,8 @@ namespace {
      * This function stores all CAT instructions in the set parameter.
      */
     void getCallInstructions(Function &F, 
-                             std::set<Instruction *> &CATInstructions,
-                             std::set<Instruction *> &nonCATInsts) {
+                             set<Instruction *> &CATInstructions,
+                             set<Instruction *> &nonCATInsts) {
       for (auto &I : instructions(F)) {
         if (auto call = dyn_cast<CallInst>(&I)) {
           Function *callee = call->getCalledFunction();
@@ -263,7 +347,7 @@ namespace {
      */
     void createDefTable(
         Function &F,
-        std::map<Instruction *, std::set<Instruction *>> &defTable) {
+        map<Instruction *, set<Instruction *>> &defTable) {
       for (auto &I : instructions(F)) {
         if (auto call = dyn_cast<CallInst>(&I)) {
           Function *callee = call->getCalledFunction();
@@ -295,11 +379,11 @@ namespace {
      * each other using LLVM alias analysis.
      */
     void createMayPointTo(
-        Function &F,
+        Function &F, 
         AliasAnalysis &AA,
-        std::map<Instruction *, std::set<Instruction *>> &mayPointTo) {
-      std::vector<StoreInst *> stores;
-      std::vector<Instruction *> loads;
+        map<Instruction *, set<Instruction *>> &mayPointTo) {
+      vector<StoreInst *> stores;
+      vector<Instruction *> loads;
 
       for (auto &I : instructions(F)) {
         if (auto store = dyn_cast<StoreInst>(&I)) {
@@ -333,17 +417,15 @@ namespace {
      * LLVM BitVectors are used to generate the initial gen, kill, 
      * in, and out sets before being transformed into sets.
      */
-    void createReachingDefs(
-        Function &F,
-        AliasAnalysis &AA,
-        std::map<Instruction *, std::set<Instruction *>> &inSets, 
-        std::map<Instruction *, std::set<Instruction *>> &outSets,
-        std::map<Instruction *, std::set<Instruction *>> defTable,
-        std::map<Instruction *, std::set<Instruction *>> mayPointTo,
-        std::set<Instruction *> nonCATInsts) {
+    void createReachingDefs(Function &F, AliasAnalysis &AA,
+                            map<Instruction *, set<Instruction *>> &inSets, 
+                            map<Instruction *, set<Instruction *>> &outSets,
+                            map<Instruction *, set<Instruction *>> defTable,
+                            map<Instruction *, set<Instruction *>> mayPointTo,
+                            set<Instruction *> nonCATInsts) {
       // Compute gen and kill sets
-      std::map<Instruction *, std::set<Instruction *>> gen;
-      std::map<Instruction *, std::set<Instruction *>> kill;
+      map<Instruction *, set<Instruction *>> gen;
+      map<Instruction *, set<Instruction *>> kill;
       computeGenKill(F, AA, gen, kill, defTable, mayPointTo, nonCATInsts);
 
       // Compute in and out sets
@@ -353,15 +435,13 @@ namespace {
     /**
      * Helper function for computing gen and kill sets.
      */
-    void computeGenKill(
-        Function &F,
-        AliasAnalysis &AA,
-        std::map<Instruction *, std::set<Instruction *>> &gen,
-        std::map<Instruction *, std::set<Instruction *>> &kill,
-        std::map<Instruction *, std::set<Instruction *>> defTable,
-        std::map<Instruction *, std::set<Instruction *>> mayPointTo,
-        std::set<Instruction *> nonCATInsts) {
-      std::set<Instruction *> escaped;
+    void computeGenKill(Function &F, AliasAnalysis &AA,
+                        map<Instruction *, set<Instruction *>> &gen,
+                        map<Instruction *, set<Instruction *>> &kill,
+                        map<Instruction *, set<Instruction *>> defTable,
+                        map<Instruction *, set<Instruction *>> mayPointTo,
+                        set<Instruction *> nonCATInsts) {
+      set<Instruction *> escaped;
       getEscapedInsts(defTable, escaped);
 
       for (auto &I : instructions(F)) {
@@ -406,7 +486,6 @@ namespace {
             if (auto escapeCall = dyn_cast<CallInst>(&I)) {
               switch (AA.getModRefBehavior(escapeCall->getCalledFunction())) {
                 case FMRB_DoesNotAccessMemory:
-                  errs() << "yes\n";
                   break;
                 default:
                   for (auto escapeVar : escaped) {
@@ -433,9 +512,8 @@ namespace {
     /**
      * This function finds every variable that escapes.
      */
-    void getEscapedInsts(
-        std::map<Instruction *, std::set<Instruction *>> defTable,
-        std::set<Instruction *> &escaped) {
+    void getEscapedInsts(map<Instruction *, set<Instruction *>> defTable,
+                         set<Instruction *> &escaped) {
       for (auto def : defTable) {
         for (auto user : def.first->users()) {
           if (auto call = dyn_cast<CallInst>(user)) {
@@ -454,11 +532,9 @@ namespace {
     /**
      * Helper function for killing instructions.
      */
-    void killHelper(
-        Instruction *killer, 
-        Instruction *killed,
-        std::map<Instruction *, std::set<Instruction *>> &kill,
-        std::map<Instruction *, std::set<Instruction *>> defTable) {
+    void killHelper(Instruction *killer, Instruction *killed,
+                    map<Instruction *, set<Instruction *>> &kill,
+                    map<Instruction *, set<Instruction *>> defTable) {
       kill[killer].insert(defTable.at(killed).begin(),
                           defTable.at(killed).end());
       kill[killer].erase(killer);
@@ -467,20 +543,19 @@ namespace {
     /**
      * Helper function for computing in and out sets.
      */
-    void computeInOut(
-        Function &F,
-        std::map<Instruction *, std::set<Instruction *>> &inSets,
-        std::map<Instruction *, std::set<Instruction *>> &outSets,
-        std::map<Instruction *, std::set<Instruction *>> gen,
-        std::map<Instruction *, std::set<Instruction *>> kill) {
+    void computeInOut(Function &F,
+                      map<Instruction *, set<Instruction *>> &inSets,
+                      map<Instruction *, set<Instruction *>> &outSets,
+                      map<Instruction *, set<Instruction *>> gen,
+                      map<Instruction *, set<Instruction *>> kill) {
       // Assign number to each instruction in F
-      std::vector<Instruction *> numToInst;
-      std::map<Instruction *, unsigned> instToNum;
+      vector<Instruction *> numToInst;
+      map<Instruction *, unsigned> instToNum;
       unsigned size = assignNumbers(F, numToInst, instToNum);
 
       // Convert the gen and kill sets to BitVectors
-      std::vector<BitVector> genBit(size);
-      std::vector<BitVector> killBit(size);
+      vector<BitVector> genBit(size);
+      vector<BitVector> killBit(size);
       for (unsigned i = 0; i < size; i++) {
         genBit[i] = BitVector(size);
         killBit[i] = BitVector(size);
@@ -495,8 +570,8 @@ namespace {
       }
 
       // Compute the in and out sets with a work list
-      std::vector<BitVector> in(size);
-      std::vector<BitVector> out(size);
+      vector<BitVector> in(size);
+      vector<BitVector> out(size);
       BitVector workList = BitVector(size, true);
       while (workList.any()) {
         int first = workList.find_first();
@@ -548,8 +623,8 @@ namespace {
      * Returns the number of instructions in function F.
      */
     unsigned assignNumbers(Function &F, 
-                           std::vector<Instruction *> &numToInst, 
-                           std::map<Instruction *, unsigned> &instToNum) {
+                           vector<Instruction *> &numToInst, 
+                           map<Instruction *, unsigned> &instToNum) {
       unsigned num = 0;
       for (auto &I : instructions(F)) {
         numToInst.push_back(&I);
@@ -562,24 +637,23 @@ namespace {
     /**
      * This function creates in and out sets for alias analysis.
      */
-    void createAliasSets(
-        Function &F,
-        AliasAnalysis &AA,
-        std::map<Instruction *, std::set<AliasValue>> &aliasIn,
-        std::map<Instruction *, std::set<AliasValue>> &aliasOut,
-        std::map<Instruction *, std::set<Instruction *>> mayPointTo,
-        std::set<Instruction *> nonCATInsts) {
+    void createAliasSets(Function &F, AliasAnalysis &AA,
+                         map<Instruction *, set<AliasValue>> &aliasIn,
+                         map<Instruction *, set<AliasValue>> &aliasOut,
+                         map<Instruction *, set<Instruction *>> mayPointTo,
+                         set<Instruction *> nonCATInsts) {
       // Compute gen and kill sets
-      std::map<Instruction *, std::set<Instruction *>> pointerToValues;
-      std::map<Instruction *, std::set<AliasValue>> aliasGen;
-      std::map<Instruction *, std::set<AliasValue>> aliasKill;
-      computeAliasGen(F, AA, aliasGen, pointerToValues, 
-                      mayPointTo, nonCATInsts);
-      computeAliasKill(F, aliasKill, pointerToValues, 
-                       mayPointTo, nonCATInsts);
+      map<Instruction *, set<Instruction *>> pointerToValues;
+      map<Instruction *, set<AliasValue>> aliasGen;
+      map<Instruction *, set<AliasValue>> aliasKill;
+      computeAliasGen(F, AA, aliasGen, pointerToValues, mayPointTo, 
+                      nonCATInsts);
+      computeAliasKill(F, aliasKill, pointerToValues, mayPointTo, 
+                       nonCATInsts);
 
       // Generate in/out sets
       bool done = false;
+
       while (!done) {
         done = true;
 
@@ -594,7 +668,7 @@ namespace {
             aliasIn[&I].insert(aliasOut[prev].begin(), aliasOut[prev].end());
           }
 
-          std::set<AliasValue> newOut;
+          set<AliasValue> newOut;
           newOut.insert(aliasGen[&I].begin(), aliasGen[&I].end());
           for (auto val : aliasIn[&I]) {
             if (!aliasKill[&I].contains(val)) {
@@ -602,7 +676,7 @@ namespace {
             }
           }
 
-          done = done & (newOut == aliasOut[&I]);
+          done &= newOut == aliasOut[&I];
           aliasOut[&I] = newOut;
         }
       }
@@ -614,10 +688,10 @@ namespace {
     void computeAliasGen(
         Function &F,
         AliasAnalysis &AA,
-        std::map<Instruction *, std::set<AliasValue>> &aliasGen,
-        std::map<Instruction *, std::set<Instruction *>> &pointerToValues,
-        std::map<Instruction *, std::set<Instruction *>> mayPointTo,
-        std::set<Instruction *> nonCATInsts) {
+        map<Instruction *, set<AliasValue>> &aliasGen,
+        map<Instruction *, set<Instruction *>> &pointerToValues,
+        map<Instruction *, set<Instruction *>> mayPointTo,
+        set<Instruction *> nonCATInsts) {
       // Compute the alias gen sets
       for (auto &I : instructions(F)) {
         // If I is a store, then for each load it may alias, insert a
@@ -681,10 +755,10 @@ namespace {
      */
     void computeAliasKill(
         Function &F,
-        std::map<Instruction *, std::set<AliasValue>> &aliasKill,
-        std::map<Instruction *, std::set<Instruction *>> pointerToValues,
-        std::map<Instruction *, std::set<Instruction *>> mayPointTo,
-        std::set<Instruction *> nonCATInsts) {
+        map<Instruction *, set<AliasValue>> &aliasKill,
+        map<Instruction *, set<Instruction *>> pointerToValues,
+        map<Instruction *, set<Instruction *>> mayPointTo,
+        set<Instruction *> nonCATInsts) {
       // Compute the alias kill sets
       // Kill every pair with the form {pointer, value != stored value}
       for (auto &I : instructions(F)) {
@@ -754,8 +828,8 @@ namespace {
      * 
      * Otherwise, it returns a null pointer.
      */
-    ConstantInt *isConstant(Value *valToCheck, std::set<Instruction *> inSet,
-                            std::set<AliasValue> mptIn) {
+    ConstantInt *isConstant(Value *valToCheck, set<Instruction *> inSet,
+                            set<AliasValue> mptIn) {
       // If the value is an argument, it is not safe 
       // to assume it is a constant
       if (isa<Argument>(valToCheck)) {
@@ -785,8 +859,8 @@ namespace {
             continue;
           }
 
-          if (!setConstants(isConstant(phiVal, inSet, mptIn), 
-                            phiConst, constant, initialized)) {
+          if (!setConstants(isConstant(phiVal, inSet, mptIn), phiConst, 
+                            constant, initialized)) {
             break;
           }
         }
@@ -802,13 +876,13 @@ namespace {
           return nullptr;
         }
 
-        if (ConstantInt* constInt = isConstant(select->getTrueValue(), 
-                                               inSet, mptIn)) {
+        if (ConstantInt* constInt = isConstant(select->getTrueValue(), inSet,
+                                               mptIn)) {
           constPtr = constInt;
           constant = constInt->getSExtValue();
           initialized = true;
 
-          if (ConstantInt* constInt = isConstant(select->getFalseValue(), 
+          if (ConstantInt* constInt = isConstant(select->getFalseValue(),
                                                  inSet, mptIn)) {
             if (constant != constInt->getSExtValue()) {
               return nullptr;
@@ -888,8 +962,8 @@ namespace {
     /**
      * Checks if a load instruction is a constant.
      */
-    ConstantInt *isLoadConstant(LoadInst *load, std::set<Instruction *> inSet,
-                                std::set<AliasValue> mptIn) {
+    ConstantInt *isLoadConstant(LoadInst *load, set<Instruction *> inSet,
+                                set<AliasValue> mptIn) {
       ConstantInt *constPtr = nullptr;
       int64_t constant;
       bool initialized;
@@ -961,8 +1035,8 @@ namespace {
      * when traversing phi nodes or select instructions.
      */
     bool containsCycle(Value *v) {
-      std::vector<Value *> stack = {v};
-      std::set<Value *> visited;
+      vector<Value *> stack = {v};
+      set<Value *> visited;
 
       while (!stack.empty()) {
         Value *val = stack.back();
@@ -1008,20 +1082,19 @@ namespace {
     /**
      * This function runs constant propagation on a set of CAT instruction.
      */
-    bool runConstantPropagation(
-        Module &M,
-        std::set<Instruction *> &CATInstructions,
-        std::map<Instruction *, std::set<Instruction *>> inSets,
-        std::map<Instruction *, std::set<AliasValue>> aliasIn) {
+    bool runConstantPropagation(Module &M,
+                                set<Instruction *> &CATInstructions,
+                                map<Instruction *, set<Instruction *>> inSets,
+                                map<Instruction *, set<AliasValue>> aliasIn) {
       bool modified = false;
-      std::map<Instruction *, ConstantInt *> toReplace;
+      map<Instruction *, ConstantInt *> toReplace;
 
       for (auto I : CATInstructions) {
         if (auto call = dyn_cast<CallInst>(I)) {
           Function *callee = call->getCalledFunction();
           if (M.getFunction("CAT_get") == callee) {
-            if (ConstantInt *c = isConstant(call->getArgOperand(0), 
-                                            inSets[I], aliasIn[I])) {
+            if (ConstantInt *c = isConstant(call->getArgOperand(0), inSets[I],
+                                            aliasIn[I])) {
               toReplace[I] = c;
               modified = true;
             }
@@ -1041,13 +1114,12 @@ namespace {
     /**
      * This function runs constant folding on a set of CAT instructions.
      */
-    bool runConstantFolding(
-        Module &M,
-        std::set<Instruction *> &CATInstructions,
-        std::map<Instruction *, std::set<Instruction *>> inSets,
-        std::map<Instruction *, std::set<AliasValue>> aliasIn) {
+    bool runConstantFolding(Module &M,
+                            set<Instruction *> &CATInstructions,
+                            map<Instruction *, set<Instruction *>> inSets,
+                            map<Instruction *, set<AliasValue>> aliasIn) {
       bool modified = false;
-      std::vector<Instruction *> toDelete;
+      vector<Instruction *> toDelete;
 
       for (auto I : CATInstructions) {
         if (auto call = dyn_cast<CallInst>(I)) {
@@ -1065,13 +1137,27 @@ namespace {
               Value *sum = ConstantInt::get(
                   intType, const1->getSExtValue() + const2->getSExtValue(), 
                   true);
+              FunctionType *funcType = FunctionType::get(
+                  Type::getVoidTy(M.getContext()),
+                  {call->getArgOperand(0)->getType(), intType},
+                  false);
 
               Instruction *newInst = builder.CreateCall(
-                  M.getFunction("CAT_set"), {call->getArgOperand(0), sum});
+                  M.getOrInsertFunction("CAT_set", funcType),
+                  {call->getArgOperand(0), sum});
               CATInstructions.insert(newInst);
 
               toDelete.push_back(I);
               modified = true;
+
+              /* if (M.getFunction("CAT_set")) {
+                Instruction *newInst = builder.CreateCall(
+                    M.getFunction("CAT_set"), {call->getArgOperand(0), sum});
+                CATInstructions.insert(newInst);
+
+                toDelete.push_back(I);
+                modified = true;
+              } */
             }
           } else if (M.getFunction("CAT_sub") == callee) {
             ConstantInt *const1 = isConstant(call->getArgOperand(1), 
@@ -1109,11 +1195,11 @@ namespace {
      */
     bool runAlgebraicSimplification(
         Module &M,
-        std::set<Instruction *> &CATInstructions,
-        std::map<Instruction *, std::set<Instruction *>> inSets,
-        std::map<Instruction *, std::set<AliasValue>> aliasIn) {
+        set<Instruction *> &CATInstructions,
+        map<Instruction *, set<Instruction *>> inSets,
+        map<Instruction *, set<AliasValue>> aliasIn) {
       bool modified = false;
-      std::vector<Instruction *> toDelete;
+      vector<Instruction *> toDelete;
 
       for (auto I : CATInstructions) {
         if (auto call = dyn_cast<CallInst>(I)) {
@@ -1121,8 +1207,8 @@ namespace {
 
           Function *callee = call->getCalledFunction();
           if (M.getFunction("CAT_add") == callee) {
-            if (ConstantInt *c = isConstant(call->getArgOperand(1), 
-                                            inSets[I], aliasIn[I])) {
+            if (ConstantInt *c = isConstant(call->getArgOperand(1), inSets[I],
+                                            aliasIn[I])) {
               // If the 2nd argument is a constant = 0, then 
               // simplify to 3rd argument
               if (c->getSExtValue() == 0) {
@@ -1155,8 +1241,8 @@ namespace {
               }
             }
           } else if (M.getFunction("CAT_sub") == callee) {
-            if (ConstantInt *c = isConstant(call->getArgOperand(2), 
-                                            inSets[I], aliasIn[I])) {
+            if (ConstantInt *c = isConstant(call->getArgOperand(2), inSets[I],
+                                            aliasIn[I])) {
               // If the 3rd argument is a constant = 0, then simplify to 2nd argument
               if (c->getSExtValue() == 0) {
                 Instruction *catGet = builder.CreateCall(
@@ -1198,8 +1284,8 @@ namespace {
     /**
      * This function prints the definitions of a variable for debugging.
      */
-    void printDefTable(Function &F, std::map<Instruction *, 
-                       std::set<Instruction *>> defTable) {
+    void printDefTable(Function &F, 
+                       map<Instruction *, set<Instruction *>> defTable) {
       for (auto [def, insts] : defTable) {
         for (auto inst : insts) {
           errs() << F.getName() << *def << *inst << "\n";
@@ -1210,10 +1296,9 @@ namespace {
     /**
      * This function prints the reaching definitions of a function F for debugging.
      */
-    void printReachingDefs(
-        Function &F,
-        std::map<Instruction *, std::set<Instruction *>> inSets, 
-        std::map<Instruction *, std::set<Instruction *>> outSets) {
+    void printReachingDefs(Function &F,
+                           map<Instruction *, set<Instruction *>> inSets, 
+                           map<Instruction *, set<Instruction *>> outSets) {
       errs() << "Function \"" << F.getName() << "\"\n";
       for (auto &I : instructions(F)) {
         errs() << "INSTRUCTION:" << I << "\nIN\n{\n";
@@ -1231,10 +1316,9 @@ namespace {
     /**
      * This function prints the alias analysis of a function F for debugging.
      */
-    void printAliasSets(
-        Function &F,
-        std::map<Instruction *, std::set<AliasValue>> aliasIn, 
-        std::map<Instruction *, std::set<AliasValue>> aliasOut) {
+    void printAliasSets(Function &F,
+                        map<Instruction *, set<AliasValue>> aliasIn, 
+                        map<Instruction *, set<AliasValue>> aliasOut) {
       errs() << "Function \"" << F.getName() << "\"\n";
       for (auto &I : instructions(F)) {
         errs() << "INSTRUCTION:" << I << "\nIN\n{\n";
@@ -1252,9 +1336,8 @@ namespace {
     /**
      * This function prints the may point to sets of a function F for debugging.
      */
-    void printMayPointTo(
-        Function &F, 
-        std::map<Instruction *, std::set<Instruction *>> mayPointTo) {
+    void printMayPointTo(Function &F, 
+                         map<Instruction *, set<Instruction *>> mayPointTo) {
       Value *val1;
       Value *val2;
       for (auto [inst, pointsTo] : mayPointTo) {
